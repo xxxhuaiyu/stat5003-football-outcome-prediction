@@ -1,0 +1,162 @@
+---
+title: "Predicting Match Outcomes in Europe's Top Five Football Leagues"
+author: "Group 2"
+format:
+  html:
+    code-fold: true
+    self-contained: true
+    toc: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(data.table)
+library(ggplot2)
+library(knitr)
+
+source("R/evaluate_model.R")
+source("R/make_folds.R")
+
+model_data <- readRDS("data/model_data.rds")
+split_data <- load_split()
+train <- split_data$train
+test <- split_data$test
+
+f3 <- function(x) sprintf("%.3f", x)
+pct <- function(x, digits = 1) sprintf(paste0("%.", digits, "f%%"), 100 * x)
+```
+
+# Introduction and Problem Statement
+
+<!-- Member 1: Replace this comment with the final project background, motivation, research question and stakeholder relevance. -->
+
+This project investigates how accurately information available before kick-off can classify football matches as a **home win**, **draw** or **away win** across Europe's top five domestic leagues.
+
+**Research question:** How accurately can football match outcomes be classified using only information available before kick-off?
+
+# Data and Feature Engineering
+
+<!-- Member 2: Summarise the data source, filtering, target construction and leakage controls. -->
+
+The modelling dataset contains matches from the top domestic leagues of England, Spain, Italy, Germany and France. All predictors are calculated using information available strictly before each fixture.
+
+## Engineered predictors
+
+<!-- Member 2: Explain the final differential features and why they were selected. -->
+
+- League-table position difference
+- Season points-per-game difference
+- Recent-form points difference
+- Recent goal-difference form
+- Home-versus-away venue-form difference
+- Head-to-head difference
+- Rest-days difference
+- Competition and season progress
+
+# Exploratory Data Analysis
+
+<!-- Replace the previous mtcars example. Keep only EDA that informs modelling decisions. -->
+
+## Outcome distribution
+
+```{r}
+#| label: outcome-distribution
+#| fig-cap: "Distribution of match outcomes in the modelling dataset."
+outcome_plot <- as.data.table(model_data)[, .N, by = result]
+outcome_plot[, share := N / sum(N)]
+
+ggplot(outcome_plot, aes(result, share, fill = result)) +
+  geom_col(show.legend = false) +
+  geom_text(aes(label = pct(share)), vjust = -0.3) +
+  scale_y_continuous(labels = scales::percent_format(),
+                     expand = expansion(mult = c(0, 0.12))) +
+  labs(x = NULL, y = "Share of matches") +
+  theme_minimal()
+```
+
+<!-- Member 2: Add 2–3 final EDA visuals covering missingness, feature relationships, correlation or time trends. Explain how each finding affects modelling. -->
+
+# Preprocessing and Validation Strategy
+
+<!-- Member 3: Consolidate the shared preprocessing and evaluation design. -->
+
+The analysis uses a chronological split. Seasons through 2022/23 form the training period, while seasons from 2023/24 onward form the untouched Final Test. Five expanding-window validation folds inside the training period support feature selection and hyperparameter tuning.
+
+The primary model-selection metric is **Macro-F1**, supported by Accuracy, Balanced Accuracy, class-level Precision, Recall and F1, and confusion matrices.
+
+<!-- Add the final missing-value, scaling, encoding and class-decision procedures. Distinguish model-specific preprocessing where needed. -->
+
+# Model Implementation
+
+## Multinomial Logistic Regression
+
+<!-- Member 1: Insert a concise summary of rationale, features, tuning, validation result and limitation. -->
+
+## Linear Discriminant Analysis
+
+<!-- Member 2: Insert a concise summary of rationale, decorrelation, assumption checks, tuning, validation result and limitation. -->
+
+## k-Nearest Neighbours
+
+<!-- Member 3: Insert a concise summary of rationale, scaling, k tuning, validation result and limitation. -->
+
+## Support Vector Machine
+
+<!-- Member 4: Insert a concise summary of kernel choice, cost/gamma tuning, validation result and limitation. -->
+
+## Random Forest
+
+<!-- Member 5: Insert a concise summary of rationale, mtry/node-size tuning, validation result, importance and limitation. -->
+
+# Model Evaluation and Final Model Selection
+
+```{r}
+#| label: model-comparison
+comparison_files <- list.files(
+  "outputs",
+  pattern = "^member[1-5]_.*comparison_row\\.csv$",
+  full.names = TRUE
+)
+
+comparison_all <- rbindlist(lapply(comparison_files, fread), fill = TRUE)
+final_models <- comparison_all[grepl("final", stage, ignore.case = TRUE)]
+final_models <- final_models[order(-macro_f1)]
+
+comparison_table <- final_models[, .(
+  Model = model,
+  Accuracy = f3(accuracy),
+  `Balanced Accuracy` = f3(balanced_accuracy),
+  `Macro-F1` = f3(macro_f1),
+  `Draw Recall` = f3(recall_draw),
+  `Draw F1` = f3(f1_draw)
+)]
+
+kable(comparison_table,
+      caption = "Final model performance on the shared Final Test set")
+```
+
+<!-- Member 4: Explain the comparison and justify the final model. Confirm that test performance was not used during tuning. -->
+
+## Final model error analysis
+
+<!-- Member 4: Insert the selected model's confusion matrix and explain the main error pattern. -->
+
+# Process Reflection
+
+<!-- All members: Explain how the Data Investigation Process structured the workflow, what worked, what did not, and what the group would change next time. -->
+
+# Conclusion and Insights
+
+<!-- Member 5: Directly answer the research question. Summarise the main finding, practical meaning, limitations and one feasible next step. -->
+
+# References
+
+<!-- Member 1: Consolidate all sources in APA 7 format. -->
+
+# AI Use Statement
+
+<!-- Member 1: Record the group's actual AI tools and uses. Do not leave placeholder text in the submitted report. -->
