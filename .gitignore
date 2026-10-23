@@ -1,0 +1,17 @@
+.DS_Store
+.Rhistory
+.RData
+.Ruserdata
+*_cache/
+*_files/
+.quarto/
+
+# Raw third-party data: download separately from the source listed in the report.
+data/*.csv
+data/domestic_games_full.rds
+
+# Rebuildable tuning caches and temporary output.
+outputs/*_cv_results.rds
+outputs/*_sens_results.rds
+outputs/.Rapp.history
+

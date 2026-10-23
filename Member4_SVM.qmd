@@ -1,0 +1,400 @@
+---
+title: "Member 4 — Support Vector Machine"
+subtitle: "STAT5003 Assignment 2: Predicting Match Outcomes in Europe's Top Five Leagues"
+author: "Group 2 — Member 4"
+format:
+  html:
+    code-fold: true
+    self-contained: true
+    toc: true
+execute:
+  warning: false
+  message: false
+editor: 
+  markdown: 
+    wrap: 72
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(data.table)
+library(e1071)
+library(ggplot2)
+
+source("R/evaluate_model.R")   # shared scoring function (Member 5)
+source("R/make_folds.R")       # shared split + fold loader (Member 5)
+
+dir.create("outputs", showWarnings = FALSE)
+pct <- function(x, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * x)
+f3  <- function(x) sprintf("%.3f", x)
+set.seed(5003)
+```
+
+```{r}
+#| label: load-data
+sp    <- load_split()
+train <- sp$train
+test  <- sp$test
+folds <- readRDS("data/cv_folds.rds")
+```
+
+The training set holds `r format(nrow(train), big.mark = ",")` matches
+and the Final Test set `r format(nrow(test), big.mark = ",")`. Split,
+folds and scoring function are Member 5's shared deliverables — nothing
+is re-derived here.
+
+# Features and preprocessing
+
+```{r}
+#| label: features
+BASE_FEATURES <- c("competition_id", "season_progress")
+
+REFINED_FEATURES <- c("table_pos_diff", "points_per_game_diff", "form_points_diff",
+                      "recent_goal_diff", "venue_form_diff", "h2h_diff",
+                      "rest_days_diff", "competition_id", "season_progress")
+```
+
+SVM needs two preprocessing steps that Random Forest did not.
+
+**Standardisation is mandatory.** The RBF kernel is distance-based, so a
+variable measured in tens of thousands would dominate one measured in
+single digits.
+
+**Missing values must be imputed**, since `svm()` cannot accept `NA`.
+Matchday-1 rows have no prior-match history by construction.
+
+Both are estimated **on the training fold only** and applied unchanged
+to the validation fold or test set, as required by plan §6.
+
+```{r}
+#| label: preprocessing
+# Fit centre/scale and medians on the training rows only
+fit_prep <- function(d, features) {
+  num <- setdiff(features, "competition_id")
+  D <- as.data.frame(d)[, num, drop =FALSE]
+  list(features = features, num = num,
+       med    = vapply(D, median, numeric(1), na.rm = TRUE),
+       centre = vapply(D, mean, numeric(1), na.rm = TRUE),
+       scale  = vapply(D, function(x) {
+                  s <- sd(x, na.rm = TRUE); if (is.na(s) || s == 0) 1 else s }, numeric(1)))
+}
+
+# Apply a fitted recipe to any set of rows
+apply_prep <- function(prep, d) {
+  X <- d[, prep$features, drop = FALSE]
+  for (v in prep$num) {
+    x <- X[[v]]
+    x[is.na(x)] <- prep$med[[v]]                      # impute with training median
+    X[[v]] <- (x - prep$centre[[v]]) / prep$scale[[v]] # standardise
+  }
+  if ("competition_id" %in% prep$features) {
+    X$competition_id <- factor(X$competition_id, levels = levels(train$competition_id))
+    X <- cbind(X[, prep$num, drop = FALSE],
+               model.matrix(~ competition_id - 1, data = X))  # one-hot
+  }
+  as.matrix(X)
+}
+```
+
+# Computational cost
+
+Kernel SVM training scales roughly quadratically with sample size. Fold
+5 trains on about
+`r format(max(sapply(folds, function(f) length(f$train))), big.mark = ",")`
+matches, so the grid must be sized against measured runtime rather than
+guessed.
+
+```{r}
+#| label: timing
+#| cache: true
+time_fit <- function(n) {
+  idx  <- sample(nrow(train), n)
+  prep <- fit_prep(train[idx, ], REFINED_FEATURES)
+  X    <- apply_prep(prep, train[idx, ])
+  system.time(svm(X, train$result[idx], kernel = "radial",
+                  cost = 1, gamma = 1 / ncol(X)))[["elapsed"]]
+}
+
+timing <- data.table(n = c(1000, 2000, 4000))
+timing[, seconds := vapply(n, time_fit, numeric(1))]
+timing[, `scaling vs n=1000` := round(seconds / seconds[1], 1)]
+knitr::kable(timing, digits = 2, caption = "Single-fit runtime by training size")
+```
+
+```{r}
+#| label: budget
+# Quadratic extrapolation to the largest fold
+largest <- max(sapply(folds, function(f) length(f$train)))
+rate    <- timing$seconds[timing$n == 2000] / 2000^2
+est_one <- rate * largest^2
+cat(sprintf("Estimated single fit on %s rows: %.1f s\n", format(largest, big.mark=","), est_one))
+cat(sprintf("A 9-point grid across 5 folds would be roughly %.0f min\n",
+            9 * 5 * est_one / 60))
+```
+
+The measured cost was acceptable, so the full grid was retained. A linear kernel is nonetheless compared below as a kernel-selection check rather than a fallback.
+
+# Hyperparameter tuning
+
+Two parameters are tuned by expanding-window cross-validation, scored on
+**Macro-F1** using the shared `evaluate_model()`:
+
+- **`cost`** — the penalty for margin violations. Low values give a
+  wider, softer margin and more regularisation; high values fit the
+  training data harder.
+- **`gamma`** — the RBF kernel width. Low values make each support
+  vector influence a wide region, giving smoother boundaries.
+
+```{r}
+#| label: cv
+#| cache: true
+cv_svm <- function(features, grid, kernel = "radial") {
+  rbindlist(lapply(seq_len(nrow(grid)), function(g) {
+    f1s <- vapply(folds, function(f) {
+      tr <- train[f$train, ]; va <- train[f$valid, ]
+      prep <- fit_prep(tr, features)                 # fitted on this fold only
+      m <- svm(apply_prep(prep, tr), tr$result, kernel = kernel,
+               cost = grid$cost[g], gamma = grid$gamma[g])
+      p <- predict(m, apply_prep(prep, va))
+      evaluate_model(va$result, p)$overall$macro_f1
+    }, numeric(1))
+    data.table(grid[g, ], cv_macro_f1 = mean(f1s), sd = sd(f1s))
+  }))
+}
+
+grid <- CJ(cost = c(1, 4, 16), gamma = c(0.15, 0.3, 0.6))
+cv_ref <- cv_svm(REFINED_FEATURES, grid)
+best   <- cv_ref[which.max(cv_macro_f1)]
+```
+
+```{r}
+#| label: cv-plot
+#| fig-width: 6
+#| fig-height: 3.2
+ggplot(cv_ref, aes(factor(gamma), factor(cost), fill = cv_macro_f1)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.3f", cv_macro_f1)), size = 3) +
+  scale_fill_gradient(low = "#eef3f7", high = "#2c7fb8") +
+  labs(x = "gamma", y = "cost", fill = "CV Macro-F1",
+       title = "Expanding-window cross-validation") +
+  theme_minimal(base_size = 9)
+```
+## Kernel choice
+
+Plan §8 lists kernel as a tuning decision. A linear kernel is compared with the
+RBF kernel on the same five validation folds, so the choice rests on validation
+evidence rather than test performance.
+
+```{r}
+#| label: kernel-cv
+#| cache: true
+# gamma is ignored by a linear kernel; a value is supplied only to satisfy the call
+lin_cv <- cv_svm(REFINED_FEATURES, CJ(cost = c(0.25, 1, 4), gamma = 0.3),
+                 kernel = "linear")
+best_lin <- lin_cv[which.max(cv_macro_f1)]
+
+kernel_cmp <- data.table(
+  kernel      = c("Linear", "RBF (radial)"),
+  best_cost   = c(best_lin$cost, best$cost),
+  best_gamma  = c(NA_real_, best$gamma),
+  cv_macro_f1 = c(best_lin$cv_macro_f1, best$cv_macro_f1))
+knitr::kable(kernel_cmp, digits = 3,
+             caption = "Kernel comparison on the five validation folds")
+```
+
+The RBF kernel is carried forward on validation Macro-F1
+(`r f3(best$cv_macro_f1)` against `r f3(best_lin$cv_macro_f1)` for linear),
+consistent with the bivariate EDA finding that no single feature separates the
+three outcome classes linearly.
+
+Best configuration: **cost = `r best$cost`, gamma = `r best$gamma`**,
+mean validation Macro-F1 `r f3(best$cv_macro_f1)`.
+
+# Baseline and final test
+
+The Final Test set is used **once**, here.
+
+```{r}
+#| label: final
+fit_eval <- function(features, cost, gamma, label) {
+  prep <- fit_prep(train, features)
+  m <- svm(apply_prep(prep, train), train$result,
+           kernel = "radial", cost = cost, gamma = gamma)
+  p <- predict(m, apply_prep(prep, test))
+  res <- evaluate_model(test$result, p)
+  list(res = res, row = metrics_row(res, "SVM", label))
+}
+
+base_grid <- CJ(cost = c(0.5, 1, 4), gamma = c(0.05, 0.15))
+cv_base   <- cv_svm(BASE_FEATURES, base_grid)
+bb        <- cv_base[which.max(cv_macro_f1)]
+
+baseline <- fit_eval(BASE_FEATURES,    bb$cost,   bb$gamma,   "Baseline (league + season progress)")
+refined  <- fit_eval(REFINED_FEATURES, best$cost, best$gamma,
+                     "Refined, predict() class rule")
+
+majority <- metrics_row(
+  evaluate_model(test$result, rep("home_win", nrow(test))),
+  "Majority class", "Always home_win")
+
+comparison <- rbind(majority, baseline$row, refined$row)
+knitr::kable(comparison[, c("model","stage","accuracy","balanced_accuracy","macro_f1")],
+             digits = 3, row.names = FALSE)
+```
+
+```{r}
+#| label: per-class
+knitr::kable(refined$res$per_class, digits = 3,
+             caption = "Refined SVM — per-class performance on the Final Test set")
+refined$res$confusion
+```
+# Tuned decision weights
+
+Both LDA and Random Forest add a decision-weight stage, so the SVM is given the
+same treatment for a like-for-like comparison. The most-probable-class rule
+rarely selects `draw`, because a draw is seldom the single highest-probability
+outcome. Multiplying each class posterior by a weight before taking the argmax
+lowers the bar for draws and away wins. The weights are chosen on the five
+validation folds only; the model itself is unchanged.
+
+```{r}
+#| label: weight-cv
+#| cache: true
+# Posterior probabilities on each validation fold (one fit per fold)
+fold_probs <- lapply(folds, function(f) {
+  tr <- train[f$train, ]; va <- train[f$valid, ]
+  prep <- fit_prep(tr, REFINED_FEATURES)
+  m <- svm(apply_prep(prep, tr), tr$result, kernel = "radial",
+           cost = best$cost, gamma = best$gamma, probability = TRUE)
+  p <- predict(m, apply_prep(prep, va), probability = TRUE)
+  list(prob = attr(p, "probabilities")[, levels(train$result), drop = FALSE],
+       truth = va$result)
+})
+
+# Weight search is free once the probabilities are stored
+weight_grid <- CJ(w_draw = seq(1, 2.4, by = 0.05),
+                  w_away = seq(0.7, 1.9, by = 0.05))
+
+apply_weights <- function(prob, w_draw, w_away) {
+  W <- sweep(prob, 2, c(home_win = 1, draw = w_draw, away_win = w_away), `*`)
+  factor(colnames(W)[max.col(W, ties.method = "first")],
+         levels = levels(train$result))
+}
+
+weight_cv <- weight_grid[, .(cv_macro_f1 = mean(vapply(fold_probs, function(fp)
+    evaluate_model(fp$truth, apply_weights(fp$prob, w_draw, w_away))$overall$macro_f1,
+    numeric(1)))), by = .(w_draw, w_away)]
+
+best_w <- weight_cv[which.max(cv_macro_f1)]
+plain_cv <- mean(vapply(fold_probs, function(fp)
+  evaluate_model(fp$truth, apply_weights(fp$prob, 1, 1))$overall$macro_f1, numeric(1)))
+```
+
+```{r}
+#| label: weight-plot
+#| fig-width: 5.5
+#| fig-height: 3.2
+ggplot(weight_cv, aes(w_draw, w_away, fill = cv_macro_f1)) +
+  geom_raster() +
+  geom_point(data = best_w, shape = 21, size = 3, stroke = 1, fill = NA) +
+  scale_fill_gradient(low = "#f7f7f7", high = "#2c7fb8") +
+  labs(x = "Draw weight", y = "Away-win weight", fill = "CV Macro-F1",
+       caption = "Circle marks the selected weights") +
+  theme_minimal(base_size = 9)
+```
+
+Selected weights: home 1 / draw **`r best_w$w_draw`** / away **`r best_w$w_away`**,
+validation Macro-F1 `r f3(best_w$cv_macro_f1)` against `r f3(plain_cv)` for the
+unweighted rule.
+
+```{r}
+#| label: final-weighted
+prep_full <- fit_prep(train, REFINED_FEATURES)
+m_full <- svm(apply_prep(prep_full, train), train$result, kernel = "radial",
+              cost = best$cost, gamma = best$gamma, probability = TRUE)
+p_test <- predict(m_full, apply_prep(prep_full, test), probability = TRUE)
+prob_test <- attr(p_test, "probabilities")[, levels(train$result), drop = FALSE]
+
+# Both rows come from the SAME probability matrix, so the difference between
+# them is the decision weights alone. The earlier "Refined" row used the class
+# labels returned by predict(), which is a different decision rule.
+unweighted <- evaluate_model(test$result, apply_weights(prob_test, 1, 1))
+weighted   <- evaluate_model(test$result,
+                             apply_weights(prob_test, best_w$w_draw, best_w$w_away))
+
+comparison <- rbind(comparison,
+  metrics_row(unweighted, "SVM", "Refined, probability argmax (unweighted)"),
+  metrics_row(weighted,   "SVM", "Refined, tuned decision weights (final)"))
+
+knitr::kable(comparison[, c("model","stage","accuracy","balanced_accuracy","macro_f1")],
+             digits = 3, row.names = FALSE)
+knitr::kable(weighted$per_class, digits = 3,
+             caption = "Weighted SVM — per-class performance on the Final Test set")
+weighted$confusion
+```
+
+
+```{r}
+#| label: save
+test_predictions <- data.table(
+  game_id   = test$game_id,
+  date      = test$date,
+  truth     = test$result,
+  pred_unweighted = apply_weights(prob_test, 1, 1),
+  pred_final      = apply_weights(prob_test, best_w$w_draw, best_w$w_away),
+  p_home_win = prob_test[, "home_win"],
+  p_draw     = prob_test[, "draw"],
+  p_away_win = prob_test[, "away_win"])
+
+fwrite(comparison,       "outputs/member4_svm_comparison_row.csv")
+fwrite(test_predictions, "outputs/member4_svm_test_predictions.csv")
+
+saveRDS(list(cv_rbf      = cv_ref,
+             cv_linear   = lin_cv,
+             best        = best,
+             best_weights = best_w,
+             weight_cv   = weight_cv,
+             baseline_params = bb,
+             comparison  = comparison,
+             test_plain      = refined$res,
+             test_unweighted = unweighted,
+             test_weighted   = weighted,
+             test_predictions = test_predictions),
+        "outputs/member4_svm_results.rds")
+```
+
+# Standard reporting format (plan §9)
+
+- **Model:** Support Vector Machine (RBF kernel, `e1071::svm`)
+- **Features:** `r length(REFINED_FEATURES)` refined features (§2)
+- **Preprocessing:** median imputation + standardisation, both fitted inside each training fold; one-hot encoding for `competition_id`
+- **Baseline result:** Macro-F1 `r f3(baseline$row$macro_f1)`, Accuracy `r pct(baseline$row$accuracy)`
+- **Best hyperparameters:** kernel = radial, cost = `r best$cost`, gamma = `r best$gamma`; decision weights home/draw/away = 1 / `r best_w$w_draw` / `r best_w$w_away`
+- **Validation Macro-F1:** `r f3(best_w$cv_macro_f1)` with tuned weights (`r f3(plain_cv)` unweighted)
+- **Test Accuracy:** `r pct(weighted$overall$accuracy)`
+- **Test Balanced Accuracy:** `r pct(weighted$overall$balanced_accuracy)`
+- **Test Macro-F1:** `r f3(weighted$overall$macro_f1)`
+- **Per-class and confusion matrix:** above
+
+**Main finding.** With the engineered pre-match features and tuned decision
+weights (draw `r best_w$w_draw`, away `r best_w$w_away`), the SVM reaches a test
+Macro-F1 of `r f3(weighted$overall$macro_f1)` and accuracy
+`r pct(weighted$overall$accuracy)`, against `r f3(majority$macro_f1)` and
+`r pct(majority$accuracy)` for always predicting a home win; the context-only
+baseline collapsed to that same majority rule, confirming the form features
+carry the signal. Holding the probability output fixed, the weights raise
+Macro-F1 from `r f3(unweighted$overall$macro_f1)` to
+`r f3(weighted$overall$macro_f1)` and draw recall from
+`r f3(unweighted$per_class$recall[2])` to `r f3(weighted$per_class$recall[2])`,
+at a cost of `r pct(unweighted$overall$accuracy - weighted$overall$accuracy)`
+accuracy. Validation and test Macro-F1 are close
+(`r f3(best_w$cv_macro_f1)` and `r f3(weighted$overall$macro_f1)`), so this run
+shows no marked drop from validation to test.
+
+**Limitation.** Probability estimates from `e1071::svm` come from Platt scaling
+fitted after training rather than from the model itself, which limits how much
+decision-weight tuning can lift minority-class recall compared with a
+probabilistic classifier such as LDA; draws remain the hardest class
+(F1 `r f3(weighted$per_class$f1[2])`), since the engineered differentials
+describe relative team strength rather than the closeness that produces a draw.

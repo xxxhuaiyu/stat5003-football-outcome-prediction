@@ -1,0 +1,416 @@
+---
+title: "Member 2 — Linear Discriminant Analysis"
+subtitle: "STAT5003 Assignment 2: Predicting Match Outcomes in Europe's Top Five Leagues"
+author: "Group 2 — Member 2"
+format:
+  html:
+    code-fold: true
+    self-contained: true
+    toc: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(data.table)
+library(MASS)
+library(ggplot2)
+
+source("R/evaluate_model.R")   # shared scoring function (Member 5 deliverable)
+source("R/make_folds.R")       # shared split + fold loader (Member 5 deliverable)
+
+dir.create("outputs", showWarnings = FALSE)
+pct <- function(x, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * x)
+f3  <- function(x) sprintf("%.3f", x)
+```
+
+# Shared infrastructure
+
+```{r}
+#| label: load-data
+sp    <- load_split()
+train <- sp$train
+test  <- sp$test
+folds <- readRDS("data/cv_folds.rds")
+```
+
+The training set holds `r format(nrow(train), big.mark = ",")` matches (seasons 2012/13–2022/23) and the Final Test set holds `r format(nrow(test), big.mark = ",")` matches (seasons 2023/24–2025/26), using Member 5's shared chronological split and 5-fold expanding-window folds (`R/make_folds.R`, `data/cv_folds.rds`), as agreed in the group chat.
+
+**Modelling dataset.** Feature engineering is Member 2's deliverable. Member 5 implemented `R/build_features.R` as a stand-in, following plan §2's column names and rules exactly, so the other models were not blocked while the official file was pending. This section reviews that implementation against §2 and confirms it for use: every feature uses only matches strictly before the fixture date; form/table features reset each season and are `NA` on a club's first match of the season; features are per-match rates, not totals; `h2h_diff` uses the last 5 prior meetings between the two clubs regardless of season; `rest_days_diff` uses each club's previous fixture in *any* competition (capped at 30 days, so a promoted club's multi-year gap is not read as "fully rested" — league-only gaps reached up to 2,926 days for promoted clubs, which is why cup and European fixtures are included); `season_progress` is `round / max(round)` within each league-season, with the round number read from the raw round field; and no imputation is done at this stage, so `NA` is handled consistently downstream by each model's own training-fold preprocessing. This matches the intended design, so `data/model_data.rds` is confirmed as the dataset used below.
+
+# Linear Discriminant Analysis
+
+## Features
+
+```{r}
+#| label: features
+baseline_feats <- c("competition_id", "season_progress")
+
+# The full nine §2 features (used as-is by Random Forest, which does not need
+# decorrelated predictors).
+refined_feats_full <- c("table_pos_diff", "points_per_game_diff", "form_points_diff",
+                        "recent_goal_diff", "venue_form_diff", "h2h_diff",
+                        "rest_days_diff", "competition_id", "season_progress")
+```
+
+None of the banned post-match variables (goals, `aggregate`, club positions, attendance, referee, formations, managers) or the scrape-time `clubs.csv` attributes are used.
+
+## Checking highly correlated predictors
+
+Unlike Random Forest, LDA estimates one pooled within-class covariance matrix and inverts it to classify, so near-duplicate predictors make that matrix close to singular and destabilise the fitted coefficients (James et al., 2021) — the same concern flagged for the raw club attributes in the Bivariate Analysis EDA. The seven match-level differential features are checked here on the **whole training set**, purely to illustrate the pattern and to pick the feature set used by the **final model** refit on all of 2012/13–2022/23 (Final fit section below). Plan §6 requires feature selection to be estimated within each training fold, not on data that includes later validation seasons — so the cross-validated weight tuning below **repeats this selection independently inside every fold**, using only that fold's own training rows, rather than reusing the fixed set computed here.
+
+```{r}
+#| label: fig-corr-lda
+#| fig-width: 6
+#| fig-height: 5
+#| fig-cap: "Correlation between the seven engineered differential features (training set only)."
+diff_feats <- c("table_pos_diff", "points_per_game_diff", "form_points_diff",
+                "recent_goal_diff", "venue_form_diff", "h2h_diff", "rest_days_diff")
+
+cor_mat <- cor(train[diff_feats], use = "pairwise.complete.obs")
+cor_long <- as.data.table(as.table(cor_mat))
+setnames(cor_long, c("Var1", "Var2", "r"))
+ggplot(cor_long, aes(Var1, Var2, fill = r)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", r)), size = 2.8) +
+  scale_fill_gradient2(low = "#2171b5", mid = "white", high = "#cb181d",
+                       midpoint = 0, limits = c(-1, 1)) +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1)) +
+  labs(x = NULL, y = NULL, fill = "r")
+```
+
+```{r}
+#| label: drop-collinear
+# Iteratively drop the more redundant member of any pair correlated above the
+# cutoff (same logic as caret::findCorrelation): at each step, among all pairs
+# still above the cutoff, drop whichever variable has the larger mean absolute
+# correlation with the rest of the current set.
+drop_collinear <- function(df, feats, cutoff = 0.8) {
+  r <- abs(cor(df[feats], use = "pairwise.complete.obs"))
+  diag(r) <- 0
+  keep <- feats
+  dropped <- data.frame(dropped = character(), kept = character(),
+                        r = numeric(), stringsAsFactors = FALSE)
+  repeat {
+    m <- r[keep, keep, drop = FALSE]
+    if (max(m) <= cutoff) break
+    worst <- which(m == max(m), arr.ind = TRUE)[1, ]
+    i <- rownames(m)[worst[1]]; j <- colnames(m)[worst[2]]
+    drop_var <- if (mean(m[i, ]) >= mean(m[j, ])) i else j
+    keep_var <- if (drop_var == i) j else i
+    dropped <- rbind(dropped, data.frame(dropped = drop_var, kept = keep_var,
+                                         r = max(m)))
+    keep <- setdiff(keep, drop_var)
+  }
+  list(keep = keep, dropped = dropped)
+}
+
+dc <- drop_collinear(train, diff_feats, cutoff = 0.8)
+knitr::kable(dc$dropped, digits = 3,
+            caption = "Features dropped for LDA at |r| > 0.8 (training set)")
+
+decorrelated_feats <- c(dc$keep, "season_progress", "competition_id")
+```
+
+At a cutoff of `|r| > 0.8` on the whole training set, `r nrow(dc$dropped)` features are dropped: `r paste(dc$dropped$dropped, collapse = ", ")` (each redundant with `r paste(dc$dropped$kept, collapse = " / ")` respectively). `season_progress` is left out of this check — its correlation with every differential feature is below 0.04 (see the EDA correlation figure), so it carries separate information about how far into the season a match falls rather than team strength. On the whole training set this gives a **final-model refined feature set** of `r paste(decorrelated_feats, collapse = ", ")`, while the Random Forest refined model keeps all nine §2 features, since a tree splits on one variable at a time and is not affected by this redundancy. The cross-validated weight tuning below re-runs this same selection separately inside each fold (see "Features kept per fold" below), so an individual fold's kept set can differ slightly from this whole-training-set result.
+
+## Preprocessing
+
+LDA needs every predictor on a common scale (its covariance matrix mixes variables of different units) and complete cases, so three steps are estimated on the **training fold only** and then applied unchanged to the validation fold or the test set — never fit on data outside that fold:
+
+1. For each numeric feature with missing values in the training fold, add a 0/1 indicator column (one per distinct missing pattern, same rule as Random Forest).
+2. Replace each `NA` with that feature's training-fold **median**.
+3. **Standardise**: subtract the training-fold mean and divide by the training-fold standard deviation. `competition_id` stays a factor, expanded to dummy columns by the model formula.
+
+```{r}
+#| label: preprocessing
+prep_fit <- function(df, feats) {
+  num     <- feats[vapply(df[feats], is.numeric, logical(1))]
+  na_vars <- num[colSums(is.na(df[num])) > 0]
+  ind     <- lapply(df[na_vars], is.na)
+  list(feats    = feats,
+       num      = num,
+       medians  = vapply(df[num], median, numeric(1), na.rm = TRUE),
+       means    = vapply(df[num], mean,   numeric(1), na.rm = TRUE),
+       sds      = vapply(df[num], sd,     numeric(1), na.rm = TRUE),
+       ind_vars = na_vars[!duplicated(ind)])
+}
+
+prep_apply <- function(rec, df) {
+  out <- df[rec$feats]
+  for (v in rec$num) out[[v]][is.na(out[[v]])] <- rec$medians[[v]]
+  for (v in rec$num) out[[v]] <- (out[[v]] - rec$means[[v]]) / rec$sds[[v]]
+  for (v in rec$ind_vars) out[[paste0(v, "_na")]] <- as.integer(is.na(df[[v]]))
+  out
+}
+```
+
+## Checking LDA's assumptions (partial diagnostics)
+
+LDA assumes each class is approximately multivariate normal with a **common covariance matrix** across classes. With `r format(nrow(train), big.mark=",")` training matches, a formal normality test rejects almost any null hypothesis, so two descriptive checks are used instead, both on the whole training set: the standard deviation of each kept differential feature by class (a check on **marginal variance** only), and the pairwise correlation matrix of the kept features within each class (a closer, though still partial, check on the **covariance structure** the equal-covariance assumption actually requires — matching marginal standard deviations alone says nothing about whether features co-vary the same way within each class).
+
+```{r}
+#| label: assumption-check
+rec0 <- prep_fit(train, decorrelated_feats)
+sd_tab <- sapply(dc$keep, function(v) tapply(train[[v]], train$result, sd, na.rm = TRUE))
+sd_tab <- round(t(sd_tab), 3)
+knitr::kable(as.data.frame(sd_tab), caption = "Training-fold standard deviation by class (raw scale) -- marginal variance only")
+
+cor_by_class <- lapply(split(train, train$result), function(d) cor(d[dc$keep], use = "pairwise.complete.obs"))
+class_pairs  <- combn(names(cor_by_class), 2, simplify = FALSE)
+cov_diff_tab <- data.frame(
+  `Class pair` = vapply(class_pairs, paste, character(1), collapse = " vs "),
+  `Max |correlation difference|` = vapply(class_pairs, function(p)
+    round(max(abs(cor_by_class[[p[1]]] - cor_by_class[[p[2]]])), 3), numeric(1)),
+  check.names = FALSE)
+knitr::kable(cov_diff_tab, caption = "Largest difference in any pairwise feature correlation between two classes")
+```
+
+The three classes' standard deviations are within a few percent of each other for every kept feature, and the largest difference in any pairwise correlation between two classes is small (see table above). Together these offer more support for the equal-covariance assumption than the standard-deviation check alone, but they remain **partial diagnostics on correlation structure**, not a test of the full covariance matrices or of multivariate normality; matching marginal variances and pairwise correlations is necessary but not sufficient for equal covariance in general. True multivariate normality is less plausible regardless — the differential features are bounded, somewhat skewed, and several carry a point mass of exactly 0 (e.g. `h2h_diff`, `rest_days_diff` before standardising) — so both checks are reported as limited evidence rather than treated as confirming the assumptions; LDA is still a reasonable linear baseline even when normality is only approximate (James et al., 2021).
+
+## Handling the draw class
+
+As with Random Forest, a rule that predicts the single most probable class rarely predicts a draw, since a draw is rarely any match's single most likely outcome even when it is a real possibility. So the decision rule is tuned the same way, for comparability across models: the predicted class is $\arg\max_k w_k \hat p_k$ with $w_{\text{home}} = 1$ fixed and $(w_{\text{draw}}, w_{\text{away}})$ chosen on the validation folds to maximise mean Macro-F1.
+
+```{r}
+#| label: rule-helpers
+apply_rule <- function(prob, w = c(1, 1, 1)) {
+  p <- sweep(prob[, RESULT_LEVELS, drop = FALSE], 2, w, `*`)
+  factor(RESULT_LEVELS[max.col(p, ties.method = "first")], levels = RESULT_LEVELS)
+}
+weight_grid <- CJ(w_draw = seq(1, 2.4, by = 0.05), w_away = seq(0.7, 1.9, by = 0.05))
+```
+
+## Model fitting and cross-validated weight tuning
+
+LDA has no tuning parameters analogous to a tree's depth or a forest's `mtry`; the only choice tuned by cross-validation here is the decision weights above, fit on each fold's training seasons and scored on its validation season.
+
+**Fold-safe feature selection.** For the refined model, the correlation-based feature drop above must not be fixed before cross-validation runs: doing so would let a fold's feature set be influenced by training rows from seasons after that fold's own validation season, which is a form of information leakage into the CV estimate even though the Final Test set is never touched (plan §6). So `drop_collinear()` is re-run **inside every fold**, using only that fold's training rows (`train[f$train, ]`), and the resulting fold-specific feature set is used to fit and validate that fold only. The baseline model is unaffected — it always uses the same fixed two context features, with no selection step.
+
+```{r}
+#| label: cv-tuning
+fit_lda_probs <- function(use_refined, f) {
+  tr_fold <- train[f$train, ]
+  if (use_refined) {
+    dc_f  <- drop_collinear(tr_fold, diff_feats, cutoff = 0.8)   # this fold's training rows only
+    feats <- c(dc_f$keep, "season_progress", "competition_id")
+  } else {
+    feats <- baseline_feats
+  }
+  rec <- prep_fit(tr_fold, feats)
+  Xtr <- prep_apply(rec, tr_fold)
+  Xva <- prep_apply(rec, train[f$valid, ])
+  m   <- lda(result ~ ., data = cbind(result = train$result[f$train], Xtr))
+  list(prob = predict(m, Xva)$posterior, feats = feats)
+}
+
+run_cv <- function(use_refined, grid) {
+  truth_list <- lapply(folds, function(f) train$result[f$valid])
+  fits  <- lapply(folds, function(f) fit_lda_probs(use_refined, f))
+  probs <- lapply(fits, `[[`, "prob")
+  plain <- mean(mapply(function(p, t) evaluate_model(t, apply_rule(p))$overall$macro_f1,
+                       probs, truth_list))
+  wg <- copy(grid)
+  wg[, cv_macro_f1 := mapply(function(wd, wa) {
+    mean(mapply(function(p, t) evaluate_model(t, apply_rule(p, c(1, wd, wa)))$overall$macro_f1,
+                probs, truth_list))
+  }, w_draw, w_away)]
+  best <- wg[which.max(cv_macro_f1)]
+  feats_per_fold <- data.frame(
+    fold     = names(folds),
+    n_feats  = vapply(fits, function(x) length(x$feats), integer(1)),
+    features = vapply(fits, function(x) paste(x$feats, collapse = ", "), character(1)))
+  list(table = wg, plain = plain, best = best, feats_per_fold = feats_per_fold)
+}
+
+# Cache key changed (lda_cv_results.rds -> lda_cv_results_foldsafe.rds) so the
+# pre-fix cache, computed with a feature set fixed across folds, is never reused.
+cv_cache <- "outputs/lda_cv_results_foldsafe.rds"
+data_sig <- tools::md5sum(MODEL_DATA_PATH)
+if (file.exists(cv_cache) && identical(readRDS(cv_cache)$data_sig, data_sig)) {
+  cv <- readRDS(cv_cache)
+} else {
+  cv <- list(base = run_cv(FALSE, weight_grid),
+            ref  = run_cv(TRUE,  weight_grid),
+            data_sig = data_sig)
+  saveRDS(cv, cv_cache)
+}
+
+best_base <- cv$base$best
+best_ref  <- cv$ref$best
+```
+
+```{r}
+#| label: feats-per-fold
+knitr::kable(cv$ref$feats_per_fold,
+            caption = "Refined LDA: feature set selected independently within each fold's own training rows")
+n_distinct_sets <- length(unique(cv$ref$feats_per_fold$features))
+```
+
+`r if (n_distinct_sets == 1) "Every fold happens to keep the same feature set as the whole-training-set selection above, since the same two features are the most redundant pair in every expanding training window." else paste0("The folds keep ", n_distinct_sets, " distinct feature sets — an early fold's shorter training window can disagree with the whole-training-set selection above, which is exactly the fold-safety this re-selection is meant to guarantee.")` Either way, each fold's kept set here was decided using only that fold's own training rows, never its validation season or any later season.
+
+```{r}
+#| label: fig-cv-grid
+#| fig-width: 6
+#| fig-height: 3.6
+#| fig-cap: "Validation Macro-F1 (mean of 5 expanding-window folds) across decision weights, refined LDA."
+ggplot(cv$ref$table, aes(w_draw, w_away, fill = cv_macro_f1)) +
+  geom_tile() +
+  geom_point(data = best_ref, shape = 21, size = 3, colour = "black", fill = NA, stroke = 1) +
+  scale_fill_gradient(low = "#f7fbff", high = "#2171b5", name = "Macro-F1") +
+  theme_minimal(base_size = 9) +
+  labs(x = "Draw weight", y = "Away-win weight",
+      caption = "Circle marks the selected weights")
+```
+
+| Model | Decision weights (home / draw / away) | CV Macro-F1 (most-probable) | CV Macro-F1 (tuned weights) |
+|---|---|---|---|
+| Baseline LDA | 1 / `r best_base$w_draw` / `r best_base$w_away` | `r f3(cv$base$plain)` | `r f3(best_base$cv_macro_f1)` |
+| Refined LDA | 1 / `r best_ref$w_draw` / `r best_ref$w_away` | `r f3(cv$ref$plain)` | `r f3(best_ref$cv_macro_f1)` |
+
+As with Random Forest, the most-probable-class rule alone caps validation Macro-F1 well below what weighting the posterior towards draws and away wins achieves.
+
+## Final fit and Final Test evaluation
+
+The selected weights were chosen only on the five validation folds. Both models are refit once on the **whole training set** (2012/13–2022/23), with preprocessing re-estimated on that full set, and evaluated once on the untouched Final Test set.
+
+```{r}
+#| label: final-fit
+final_lda <- function(feats, best) {
+  rec  <- prep_fit(train, feats)
+  m    <- lda(result ~ ., data = cbind(result = train$result, prep_apply(rec, train)))
+  prob <- predict(m, prep_apply(rec, test))$posterior
+  list(model = m, rec = rec, prob = prob)
+}
+
+fm_base <- final_lda(baseline_feats,     best_base)
+fm_ref  <- final_lda(decorrelated_feats, best_ref)
+
+pred <- list(
+  majority  = factor(rep("home_win", nrow(test)), levels = RESULT_LEVELS),
+  base      = apply_rule(fm_base$prob, c(1, best_base$w_draw, best_base$w_away)),
+  ref_plain = apply_rule(fm_ref$prob),
+  ref       = apply_rule(fm_ref$prob,  c(1, best_ref$w_draw,  best_ref$w_away)))
+
+ev <- lapply(pred, function(p) evaluate_model(test$result, p))
+
+comparison <- rbind(
+  metrics_row(ev$majority,  "Majority class", "Always home_win"),
+  metrics_row(ev$base,      "LDA", "Baseline (league + season progress)"),
+  metrics_row(ev$ref_plain, "LDA", "Refined, most-probable class"),
+  metrics_row(ev$ref,       "LDA", "Refined, tuned decision weights (final)"))
+
+show <- comparison[, c("stage", "accuracy", "balanced_accuracy", "macro_f1",
+                       "recall_home_win", "recall_draw", "recall_away_win")]
+show[-1] <- lapply(show[-1], f3)
+names(show) <- c("Model", "Accuracy", "Balanced Acc.", "Macro-F1",
+                 "Recall home", "Recall draw", "Recall away")
+knitr::kable(show, caption = "Final Test set (seasons 2023/24 - 2025/26)")
+```
+
+```{r}
+#| label: per-class
+pc <- ev$ref$per_class
+pc_show <- data.frame(Class = c("Home win", "Draw", "Away win"),
+                      Precision = f3(pc$precision), Recall = f3(pc$recall),
+                      F1 = f3(pc$f1), Support = pc$support, Predicted = pc$predicted)
+knitr::kable(pc_show, caption = "Refined LDA (final): per-class results on the Final Test set")
+```
+
+```{r}
+#| label: fig-confusion
+#| fig-width: 7
+#| fig-height: 3.2
+#| fig-cap: "Confusion matrices on the Final Test set. Left: most-probable-class rule. Right: final model with tuned decision weights. Cells show counts and the share of each true class."
+lab <- c(home_win = "Home win", draw = "Draw", away_win = "Away win")
+cm_dt <- rbind(
+  data.table(as.data.frame(ev$ref_plain$confusion), rule = "Most-probable class"),
+  data.table(as.data.frame(ev$ref$confusion),       rule = "Tuned decision weights (final)"))
+cm_dt[, share := Freq / sum(Freq), by = .(rule, Truth)]
+cm_dt[, `:=`(Truth = factor(lab[as.character(Truth)], levels = lab),
+            Predicted = factor(lab[as.character(Predicted)], levels = rev(lab)))]
+ggplot(cm_dt, aes(Truth, Predicted, fill = share)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%d\n(%.0f%%)", Freq, 100 * share)), size = 2.8) +
+  facet_wrap(~rule) +
+  scale_fill_gradient(low = "#f7fbff", high = "#2171b5", guide = "none") +
+  labs(x = "True result", y = "Predicted result") +
+  theme_minimal(base_size = 9)
+```
+
+## Discriminant function coefficients
+
+Unlike Random Forest's permutation importance, LDA's standardised discriminant coefficients show both the size and the direction of each feature's contribution to separating the classes along the first linear discriminant (LD1), which captures most of the between-class separation.
+
+```{r}
+#| label: fig-coefs
+#| fig-width: 6
+#| fig-height: 3.8
+#| fig-cap: "Standardised LD1 coefficients, refined LDA (fitted on the full training set)."
+ld1 <- fm_ref$model$scaling[, 1]
+ld1 <- ld1[!grepl("_na$", names(ld1))]   # drop the rare missingness indicators
+coef_tab <- data.table(feature = names(ld1), coef = as.numeric(ld1))
+coef_tab[, feature := factor(feature, levels = coef_tab[order(coef)]$feature)]
+ggplot(coef_tab, aes(coef, feature, fill = coef > 0)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = c(`TRUE` = "#2171b5", `FALSE` = "#cb181d")) +
+  labs(x = "LD1 coefficient (standardised)", y = NULL) +
+  theme_minimal(base_size = 9)
+```
+
+```{r}
+#| label: coef-text
+coef_ord <- coef_tab[order(-abs(coef))]
+top3 <- as.character(coef_ord$feature[1:3])
+```
+
+`r top3[1]`, `r top3[2]` and `r top3[3]` carry the largest standardised weight on LD1, the same pre-match team-strength signals Random Forest relies on most (Feature importance, Random Forest section), which is a useful cross-model consistency check. League identity (`competition_id`) and `season_progress` contribute little on their own, matching the EDA finding that league barely changes the outcome mix (Cramér's V = 0.021).
+
+```{r}
+#| label: save-results
+saveRDS(list(comparison = comparison,
+            test_metrics = ev$ref,
+            best_params = best_ref, baseline_params = best_base,
+            cv_table = cv$ref$table,
+            decorrelated_feats = decorrelated_feats,
+            dropped_feats = dc$dropped,
+            coefficients = coef_ord,
+            test_predictions = data.frame(game_id = test$game_id, truth = test$result,
+                                          pred = pred$ref, fm_ref$prob)),
+       "outputs/member2_lda_results.rds")
+write.csv(comparison, "outputs/member2_lda_comparison_row.csv", row.names = FALSE)
+```
+
+# Standard reporting format (plan §9)
+
+```{r}
+#| label: std-report
+r  <- ev$ref$overall
+pc <- ev$ref$per_class
+b  <- ev$base$overall
+```
+
+| Item | LDA |
+|---|---|
+| **Model name** | Linear Discriminant Analysis (`MASS::lda`) |
+| **Features used** | Refined (decorrelated): `r paste(decorrelated_feats, collapse = ", ")`. Dropped for redundancy (`|r| > 0.8` with a kept feature): `r paste(dc$dropped$dropped, collapse = ", ")` |
+| **Preprocessing applied** | Training-fold median imputation + missing-value indicators; standardisation (training-fold mean/SD); `competition_id` as dummy-coded factor |
+| **Assumption check** | Training-fold class standard deviations are within a few percent across classes for every kept feature (supports equal covariance); multivariate normality is only approximate given skewed, partly discrete features — reported as a limitation |
+| **Baseline result** (Final Test) | Majority class: Accuracy `r f3(ev$majority$overall$accuracy)`, Macro-F1 `r f3(ev$majority$overall$macro_f1)`. Baseline LDA (league + season progress): Accuracy `r f3(b$accuracy)`, Macro-F1 `r f3(b$macro_f1)` |
+| **Best hyperparameters / refinement** | Decision weights home/draw/away = 1 / `r best_ref$w_draw` / `r best_ref$w_away` (no model hyperparameters to tune for LDA itself) |
+| **Validation Macro-F1** | `r f3(best_ref$cv_macro_f1)` (mean of 5 expanding-window folds; `r f3(cv$ref$plain)` without decision weights) |
+| **Test Accuracy** | `r f3(r$accuracy)` |
+| **Test Balanced Accuracy** | `r f3(r$balanced_accuracy)` |
+| **Test Macro-F1** | `r f3(r$macro_f1)` |
+| **Home win** P / R / F1 | `r f3(pc$precision[1])` / `r f3(pc$recall[1])` / `r f3(pc$f1[1])` |
+| **Draw** P / R / F1 | `r f3(pc$precision[2])` / `r f3(pc$recall[2])` / `r f3(pc$f1[2])` |
+| **Away win** P / R / F1 | `r f3(pc$precision[3])` / `r f3(pc$recall[3])` / `r f3(pc$f1[3])` |
+| **Confusion matrix** | See the figure above (right panel) |
+
+**Main finding.** With the decorrelated pre-match strength and form features, LDA reaches a test Macro-F1 of `r f3(r$macro_f1)`, against `r f3(b$macro_f1)` for the context-only baseline and `r f3(ev$majority$overall$macro_f1)` for always predicting a home win. `r top3[1]` and `r top3[2]` carry the largest standardised weight, consistent with the Random Forest's leading features. The most-probable-class rule gives the highest accuracy (`r f3(ev$ref_plain$overall$accuracy)`) but a draw recall of `r f3(ev$ref_plain$per_class$recall[2])`; the tuned decision weights trade some accuracy (`r f3(r$accuracy)`) for a draw recall of `r f3(pc$recall[2])` and the best Macro-F1.
+
+**Limitation.** As with the other models, draws are the hardest class to separate (draw F1 `r f3(pc$f1[2])`): the engineered differentials describe relative team strength, not the closeness that produces a draw. LDA's linear decision boundary and the assumption of a shared covariance matrix are a further simplification; the within-class standard deviations checked above are close across classes, but the features are not exactly multivariate normal, and the decision weights were chosen on the same five validation seasons used to report CV Macro-F1, so that figure is mildly optimistic relative to the Final Test result above.

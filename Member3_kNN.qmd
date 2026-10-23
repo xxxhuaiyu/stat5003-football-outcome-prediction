@@ -1,0 +1,456 @@
+---
+title: "Member 3 — k-Nearest Neighbours (kNN)"
+subtitle: "STAT5003 Assignment 2: Predicting Match Outcomes in Europe's Top Five Leagues"
+author: "Group 2 — Member 3"
+format:
+  html:
+    code-fold: true
+    self-contained: true
+    toc: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+# install.packages("FNN")   # run once if FNN is not installed
+library(data.table)
+library(FNN)
+library(ggplot2)
+
+source("R/evaluate_model.R")   # shared scoring function (Member 5)
+source("R/make_folds.R")       # shared split + fold loader (Member 5)
+
+dir.create("outputs", showWarnings = FALSE)
+pct <- function(x, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * x)
+f3  <- function(x) sprintf("%.3f", x)
+```
+
+# Shared inputs and data checks
+
+This document uses exactly the objects the plan fixes for all five members. Nothing is re-split or re-scored here.
+
+| Shared object | Source |
+|---|---|
+| Modelling dataset | `data/model_data.rds` (path set by `MODEL_DATA_PATH` in `R/make_folds.R`) |
+| Chronological split | `load_split()`: train = seasons 2012–2022, Final Test = seasons 2023–2025 |
+| 5 expanding-window folds | `data/cv_folds.rds`; validation seasons 2018 to 2022 |
+| Scoring | `evaluate_model()` and `metrics_row()` from `R/evaluate_model.R` |
+
+```{r}
+#| label: load-data
+sp    <- load_split()
+train <- sp$train
+test  <- sp$test
+folds <- readRDS("data/cv_folds.rds")
+
+# ---- sanity checks (fail loudly if the shared files do not line up) ----------
+stopifnot(!is.unsorted(train$date), !is.unsorted(test$date))
+stopifnot(max(train$season) <= 2022, min(test$season) >= 2023)
+stopifnot(length(folds) == 5)
+for (f in folds) {
+  stopifnot(identical(train$game_id[f$train], f$train_game_id),
+            identical(train$game_id[f$valid], f$valid_game_id),
+            max(train$season[f$train]) < f$valid_season,
+            all(train$season[f$valid] == f$valid_season))
+}
+
+banned <- c("home_club_goals", "away_club_goals", "aggregate", "home_club_position",
+            "away_club_position", "attendance", "referee")
+stopifnot(!any(banned %in% names(train)))
+
+fold_tab <- rbindlist(lapply(folds, function(f) data.table(
+  `Validation season` = sprintf("%d/%02d", f$valid_season, (f$valid_season + 1) %% 100),
+  `Training seasons`  = sprintf("2012/13 – %d/%02d", f$valid_season - 1, f$valid_season %% 100),
+  `Train n` = length(f$train), `Validation n` = length(f$valid))))
+knitr::kable(fold_tab, caption = "Expanding-window folds inside the training set")
+```
+
+The training set holds `r format(nrow(train), big.mark = ",")` matches and the Final Test set holds `r format(nrow(test), big.mark = ",")`. The majority-class rate (always predict a home win) is `r pct(mean(train$result == "home_win"))` in the training set and `r pct(mean(test$result == "home_win"))` in the Final Test set. The Final Test figure is the correct reference for the test comparison below. The Final Test set is used once, at the end.
+
+`train` also carries identifier columns (`game_id`, `date`, `season`, `home_club_id`, `away_club_id`). They are **never** used as predictors: a club ID is a label, not a quantity, and would be meaningless inside a distance.
+
+# kNN
+
+## Features
+
+```{r}
+#| label: features
+baseline_feats <- c("competition_id", "season_progress")
+refined_feats  <- c("table_pos_diff", "points_per_game_diff", "form_points_diff",
+                    "recent_goal_diff", "venue_form_diff", "h2h_diff",
+                    "rest_days_diff", "competition_id", "season_progress")
+stopifnot(all(refined_feats %in% names(train)))
+
+na_tab <- data.frame(
+  feature = refined_feats,
+  `NA in train (%)` = round(100 * colMeans(is.na(train[refined_feats])), 2),
+  check.names = FALSE, row.names = NULL)
+knitr::kable(na_tab, caption = "Missingness of the refined features in the training set")
+```
+
+* **Baseline model:** `competition_id` and `season_progress` only. No team-strength information.
+* **Refined model:** all nine §2 features.
+
+No banned post-match variable and none of the `clubs.csv` snapshot attributes are used.
+
+## Preprocessing
+
+kNN classifies a match from the matches that look most similar to it, so every variable's scale and encoding directly changes who counts as a "neighbour". All steps below are **estimated on the training fold only** and then applied unchanged to the validation fold or the Final Test set.
+
+1. **Missing values.** Each NA is replaced by that feature's training-fold median. Matchday-1 rows get a median value, which reads as "average team". As a tuned option, one 0/1 column `no_history` marks missing `points_per_game_diff`, which under the shared feature construction means at least one team lacks prior league-match history in the current season (`flag`). It does not imply that both teams lack history or that head-to-head and venue histories are all missing, so that "no information yet" can be told apart from "evenly matched". Member 5 adds one indicator per NA pattern for a tree. Here that would add several columns to a distance, so a single indicator is used and CV decides whether it helps.
+2. **Standardisation.** Every numeric feature is converted to a z-score with the training-fold mean and standard deviation (computed after imputation). Without this, `rest_days_diff` (range ±27) would dominate `points_per_game_diff` (range ±3).
+3. **Categorical encoding.** `competition_id` is one-hot encoded into five 0/1 columns, multiplied by a weight `lw`. The league columns contribute a distance of `sqrt(2) * lw` between matches from different leagues (about 1.41 when `lw = 1`). A larger league weight penalises cross-league neighbours and may favour neighbours from the same league, but does not exclude matches from other leagues or imply a fivefold reduction in the neighbour pool. The EDA showed league identity barely changes the outcome mix (Cramér's V = 0.021), so `lw` is tuned over {0.3, 1}.
+4. The 0/1 columns are not z-scored: a z-score of a rare indicator would be very large and would dominate the distance. A numeric feature with no observed training-fold values causes an explicit error because its median cannot be estimated. A zero training-fold standard deviation is replaced by 1, so a constant training column is centred to zero without division by zero; the same fitted transform is applied to validation and test data.
+
+```{r}
+#| label: preprocessing
+prep_fit <- function(df, feats, flag = FALSE, lw = 1) {
+  num <- feats[vapply(df[feats], is.numeric, logical(1))]
+  all_missing <- num[vapply(df[num], function(x) all(is.na(x)), logical(1))]
+  if (length(all_missing))
+    stop("Cannot estimate training-fold medians for all-missing features: ",
+         paste(all_missing, collapse = ", "))
+  med <- vapply(df[num], median, numeric(1), na.rm = TRUE)
+  if (any(!is.finite(med))) stop("Non-finite training-fold median")
+  filled <- df[num]
+  for (v in num) filled[[v]][is.na(filled[[v]])] <- med[[v]]
+  mu <- vapply(filled, mean, numeric(1))
+  sdv <- vapply(filled, sd, numeric(1))
+  if (any(!is.finite(mu)) || any(!is.finite(sdv)))
+    stop("Non-finite training-fold mean or standard deviation")
+  sdv[sdv == 0] <- 1
+  list(feats = feats, num = num, med = med,
+       mu = mu, sdv = sdv,
+       lev = levels(df$competition_id),
+       flag = flag, lw = lw)
+}
+
+prep_apply <- function(rec, df) {
+  X <- df[rec$num]
+  for (v in rec$num) {
+    x <- X[[v]]
+    x[is.na(x)] <- rec$med[[v]]
+    X[[v]] <- (x - rec$mu[[v]]) / rec$sdv[[v]]
+  }
+  if ("competition_id" %in% rec$feats)
+    for (l in rec$lev) X[[paste0("lg_", l)]] <- rec$lw * as.numeric(df$competition_id == l)
+  if (rec$flag) X$no_history <- as.numeric(is.na(df$points_per_game_diff))
+  X <- as.matrix(X)
+  if (any(!is.finite(X))) stop("Preprocessing produced non-finite predictor values")
+  X
+}
+```
+
+## From neighbours to class probabilities
+
+For each match, the `k` nearest training matches (Euclidean distance on the standardised features) are found, and the share of home wins, draws and away wins among them is the predicted probability of each result. The neighbours are searched once per fold at the largest `k`; every smaller `k` uses the first `k` of those neighbours, so the search is not repeated.
+
+As with any method that takes the most common class, plain voting almost never predicts a draw. As in the Random Forest, the decision is the class with the largest weighted probability, $\arg\max_k w_k \hat p_k$, with $w_{\text{home}} = 1$ fixed and $(w_{\text{draw}}, w_{\text{away}})$ chosen to maximise mean validation Macro-F1. All weights equal to 1 is plain voting, and it is reported alongside.
+
+```{r}
+#| label: rule-helpers
+ycode <- as.integer(train$result)            # 1 = home_win, 2 = draw, 3 = away_win
+stopifnot(identical(levels(train$result), RESULT_LEVELS))
+
+# class shares among the first k neighbours, for several k at once
+neighbor_probs <- function(idx, ycode_train, ks) {
+  cls <- matrix(ycode_train[idx], nrow = nrow(idx))     # class of each neighbour
+  cum <- lapply(1:3, function(c) t(apply(cls == c, 1, cumsum))[, ks, drop = FALSE])
+  lapply(seq_along(ks), function(j) {
+    p <- cbind(cum[[1]][, j], cum[[2]][, j], cum[[3]][, j]) / ks[j]
+    colnames(p) <- RESULT_LEVELS
+    p
+  })
+}
+
+apply_rule <- function(prob, w = c(1, 1, 1)) {
+  p <- sweep(prob[, RESULT_LEVELS, drop = FALSE], 2, w, `*`)
+  factor(RESULT_LEVELS[max.col(p, ties.method = "first")], levels = RESULT_LEVELS)
+}
+
+weight_grid <- CJ(w_draw = seq(1, 2.2, by = 0.05), w_away = seq(0.8, 1.8, by = 0.05))
+
+# Mean Macro-F1 across folds for every weight pair (scored by evaluate_model)
+score_weights <- function(prob_list, truth_list) {
+  copy(weight_grid)[, cv_macro_f1 := mapply(function(wd, wa) {
+    mean(mapply(function(p, t) evaluate_model(t, apply_rule(p, c(1, wd, wa)))$overall$macro_f1,
+                prob_list, truth_list))
+  }, w_draw, w_away)][]
+}
+```
+
+## Hyperparameter tuning (5-fold expanding window)
+
+Tuned on the validation folds:
+
+* `k`, the number of neighbours. Small `k` follows individual results, which are mostly noise here; large `k` averages over many similar matches.
+* `lw`, the weight of the league columns, over {0.3, 1}.
+* `flag`, whether the `no_history` column is added (refined model only).
+* the decision weights $(w_{\text{draw}}, w_{\text{away}})$.
+
+For every setting, each fold standardises on its own training seasons and predicts its own validation season.
+
+```{r}
+#| label: cv-tuning
+ks <- c(5, 11, 21, 41, 71, 101, 151, 201, 301, 501)
+
+run_cv <- function(feats, variants, ks) {
+  truth_list <- lapply(folds, function(f) train$result[f$valid])
+  nk    <- length(ks)
+  probs <- lapply(seq_len(nrow(variants) * nk), function(i) vector("list", length(folds)))
+  for (v in seq_len(nrow(variants))) {
+    for (fi in seq_along(folds)) {
+      f   <- folds[[fi]]
+      rec <- prep_fit(train[f$train, ], feats, variants$flag[v], variants$lw[v])
+      Xtr <- prep_apply(rec, train[f$train, ])
+      Xva <- prep_apply(rec, train[f$valid, ])
+      idx <- FNN::knnx.index(Xtr, Xva, k = max(ks))
+      pk  <- neighbor_probs(idx, ycode[f$train], ks)
+      for (j in seq_len(nk)) probs[[(v - 1) * nk + j]][[fi]] <- pk[[j]]
+    }
+  }
+  res <- rbindlist(lapply(seq_along(probs), function(i) {
+    v <- (i - 1) %/% nk + 1
+    j <- (i - 1) %%  nk + 1
+    plain <- mean(mapply(function(p, t) evaluate_model(t, apply_rule(p))$overall$macro_f1,
+                         probs[[i]], truth_list))
+    wg   <- score_weights(probs[[i]], truth_list)
+    best <- wg[which.max(cv_macro_f1)]
+    data.table(variants[v], k = ks[j], cv_macro_f1_plain = plain,
+               w_draw = best$w_draw, w_away = best$w_away, cv_macro_f1 = best$cv_macro_f1)
+  }))
+  list(table = res)
+}
+
+cv_cache <- "outputs/knn_cv_results.rds"
+data_sig <- paste(tools::md5sum(MODEL_DATA_PATH), paste(ks, collapse = ","), "v1")
+if (file.exists(cv_cache) && identical(readRDS(cv_cache)$data_sig, data_sig)) {
+  cv <- readRDS(cv_cache)
+} else {
+  base_var <- CJ(flag = FALSE,            lw = c(0.3, 1))
+  ref_var  <- CJ(flag = c(FALSE, TRUE),   lw = c(0.3, 1))
+  t0 <- Sys.time()
+  cv <- list(base = run_cv(baseline_feats, base_var, ks),
+             ref  = run_cv(refined_feats,  ref_var,  ks),
+             data_sig = data_sig)
+  cv$minutes <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+  saveRDS(cv, cv_cache)
+}
+
+best_base <- cv$base$table[which.max(cv_macro_f1)]
+best_ref  <- cv$ref$table[which.max(cv_macro_f1)]
+```
+
+```{r}
+#| label: fig-cv-k
+#| fig-width: 7.5
+#| fig-height: 3.4
+#| fig-cap: "Validation Macro-F1 (mean of 5 expanding-window folds) against k for the refined kNN. Each line is one (flag, lw) setting. Left: plain voting. Right: tuned decision weights."
+cvl <- melt(cv$ref$table, id.vars = c("k", "flag", "lw"),
+            measure.vars = c("cv_macro_f1_plain", "cv_macro_f1"),
+            variable.name = "rule", value.name = "macro_f1")
+cvl[, rule := factor(rule, levels = c("cv_macro_f1_plain", "cv_macro_f1"),
+                     labels = c("Plain voting", "Tuned decision weights"))]
+cvl[, setting := sprintf("flag=%s, lw=%.1f", flag, lw)]
+ggplot(cvl, aes(k, macro_f1, colour = setting)) +
+  geom_line() + geom_point(size = 1) +
+  scale_x_log10(breaks = ks) +
+  facet_wrap(~rule) +
+  labs(x = "k (log scale)", y = "Validation Macro-F1", colour = NULL) +
+  theme_minimal(base_size = 9) + theme(legend.position = "bottom",
+                                       axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+#| label: tuning-summary
+tune_tab <- data.frame(
+  Model = c("Baseline kNN", "Refined kNN"),
+  k  = c(best_base$k, best_ref$k),
+  lw = c(best_base$lw, best_ref$lw),
+  `no_history flag` = c(best_base$flag, best_ref$flag),
+  w_draw = c(best_base$w_draw, best_ref$w_draw),
+  w_away = c(best_base$w_away, best_ref$w_away),
+  `CV Macro-F1 (plain at weighted-model settings)` = f3(c(best_base$cv_macro_f1_plain, best_ref$cv_macro_f1_plain)),
+  `CV Macro-F1 (tuned weights)` = f3(c(best_base$cv_macro_f1, best_ref$cv_macro_f1)),
+  check.names = FALSE)
+knitr::kable(tune_tab, caption = "Selected settings (best mean validation Macro-F1)")
+```
+
+```{r}
+#| label: tuning-numbers
+rt <- cv$ref$table
+k_best_plain <- rt[which.max(cv_macro_f1_plain)]
+```
+
+Two things to read from the table and figure.
+
+1. **How much `k` matters.** Among the candidate values tested (`r paste(ks, collapse = ", ")`), the refined setting with the highest mean validation Macro-F1 has `k` = `r best_ref$k`. This is the best value within the tested grid, not a claim of a globally optimal `k`. Since it lies at the upper search boundary, larger values could potentially improve validation performance; the search grid has not been expanded using test results. Across all refined settings with tuned weights, validation Macro-F1 ranges from `r f3(min(rt$cv_macro_f1))` to `r f3(max(rt$cv_macro_f1))`.
+2. **Decision-rule effect versus independently tuned pipelines.** At the weighted model's selected neighbour settings, plain voting gives validation Macro-F1 `r f3(best_ref$cv_macro_f1_plain)`, compared with `r f3(best_ref$cv_macro_f1)` after decision weighting. Independently selecting the plain-voting configuration by validation Macro-F1 gives `r f3(k_best_plain$cv_macro_f1_plain)` (`k` = `r k_best_plain$k`, `lw` = `r k_best_plain$lw`, `flag` = `r k_best_plain$flag`). The first comparison isolates the decision rule; the second compares separately tuned pipelines.
+
+The weighted pipeline remains the designated final model because its best mean validation Macro-F1 exceeds that of the independently tuned plain pipeline. Both configurations are selected from training-set validation results before the test predictions below; test performance does not determine which pipeline is retained. The independently tuned plain pipeline is a supplementary comparison added after the original test results had already been inspected, not a new untouched-test experiment.
+
+The settings and weights were chosen on the same five folds, so validation Macro-F1 is slightly optimistic. The Final Test results below are kept separate from validation-based configuration selection; the supplementary plain-pipeline comparison is identified explicitly.
+
+### Sensitivity: collinearity of `table_pos_diff`
+
+`table_pos_diff` and `points_per_game_diff` are strongly correlated (about 0.90 in the training set). In a Euclidean distance, correlated features count the same information several times. As a check, the best refined setting is re-run without `table_pos_diff`.
+
+```{r}
+#| label: sensitivity
+sens_cache <- "outputs/knn_sens_results.rds"
+sens_sig   <- paste(data_sig, best_ref$flag, best_ref$lw)
+if (file.exists(sens_cache) && identical(readRDS(sens_cache)$sig, sens_sig)) {
+  sens <- readRDS(sens_cache)$res
+} else {
+  sens <- run_cv(setdiff(refined_feats, "table_pos_diff"),
+                 data.table(flag = best_ref$flag, lw = best_ref$lw), ks)$table
+  saveRDS(list(sig = sens_sig, res = sens), sens_cache)
+}
+best_sens <- sens[which.max(cv_macro_f1)]
+knitr::kable(data.frame(
+  Features = c("All nine", "Without table_pos_diff"),
+  k = c(best_ref$k, best_sens$k),
+  `CV Macro-F1 (tuned weights)` = f3(c(best_ref$cv_macro_f1, best_sens$cv_macro_f1)),
+  check.names = FALSE), caption = "Effect of dropping the most collinear feature (validation only)")
+```
+
+The final model keeps all nine features, as the plan specifies. This table only shows whether the duplicated information matters.
+
+## Final fit and Final Test evaluation
+
+The validation-selected settings are refit on the **whole training set** (2012/13–2022/23). The preprocessing is re-estimated on that set. The test table separates plain voting at the weighted model's settings from the independently tuned plain pipeline; the latter is a supplementary evaluation added after the original test results were inspected. No settings or final-model designation are changed using test performance.
+
+```{r}
+#| label: final-fit
+final_knn <- function(feats, best) {
+  rec <- prep_fit(train, feats, best$flag, best$lw)
+  Xtr <- prep_apply(rec, train)
+  Xte <- prep_apply(rec, test)
+  idx <- FNN::knnx.index(Xtr, Xte, k = best$k)
+  neighbor_probs(idx, ycode, best$k)[[1]]
+}
+
+prob_base <- final_knn(baseline_feats, best_base)
+prob_ref  <- final_knn(refined_feats,  best_ref)
+prob_plain_best <- final_knn(refined_feats, k_best_plain)
+
+pred <- list(
+  majority  = factor(rep("home_win", nrow(test)), levels = RESULT_LEVELS),
+  base      = apply_rule(prob_base, c(1, best_base$w_draw, best_base$w_away)),
+  ref_plain = apply_rule(prob_ref),
+  plain_best = apply_rule(prob_plain_best),
+  ref       = apply_rule(prob_ref, c(1, best_ref$w_draw, best_ref$w_away)))
+
+ev <- lapply(pred, function(p) evaluate_model(test$result, p))
+
+comparison <- rbind(
+  metrics_row(ev$majority,  "Majority class", "Always home_win"),
+  metrics_row(ev$base,      "kNN", "Baseline (league + season progress)"),
+  metrics_row(ev$ref_plain, "kNN", "Plain voting at weighted-model settings"),
+  metrics_row(ev$plain_best, "kNN", "Plain voting independently tuned on validation"),
+  metrics_row(ev$ref,       "kNN", "Refined, tuned decision weights (final)"))
+
+show <- comparison[, c("stage", "accuracy", "balanced_accuracy", "macro_f1",
+                       "recall_home_win", "recall_draw", "recall_away_win")]
+show[-1] <- lapply(show[-1], f3)
+names(show) <- c("Model", "Accuracy", "Balanced Acc.", "Macro-F1",
+                 "Recall home", "Recall draw", "Recall away")
+knitr::kable(show, caption = "Final Test set (seasons 2023/24 – 2025/26)")
+```
+
+```{r}
+#| label: per-class
+pc <- ev$ref$per_class
+pc_show <- data.frame(Class = c("Home win", "Draw", "Away win"),
+                      Precision = f3(pc$precision), Recall = f3(pc$recall),
+                      F1 = f3(pc$f1), Support = pc$support, Predicted = pc$predicted)
+knitr::kable(pc_show, caption = "Refined kNN (final): per-class results on the Final Test set")
+```
+
+```{r}
+#| label: fig-confusion
+#| fig-width: 7
+#| fig-height: 3.2
+#| fig-cap: "Confusion matrices on the Final Test set at the weighted model's neighbour settings. Left: plain voting. Right: final model with tuned decision weights. Cells show counts and the share of each true class. The independently tuned plain pipeline is reported separately in the test table."
+lab <- c(home_win = "Home win", draw = "Draw", away_win = "Away win")
+cm_dt <- rbind(
+  data.table(as.data.frame(ev$ref_plain$confusion), rule = "Plain voting at weighted-model settings"),
+  data.table(as.data.frame(ev$ref$confusion),       rule = "Tuned decision weights (final)"))
+cm_dt[, share := Freq / sum(Freq), by = .(rule, Truth)]
+cm_dt[, `:=`(Truth = factor(lab[as.character(Truth)], levels = lab),
+             Predicted = factor(lab[as.character(Predicted)], levels = rev(lab)))]
+ggplot(cm_dt, aes(Truth, Predicted, fill = share)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%d\n(%.0f%%)", Freq, 100 * share)), size = 2.8) +
+  facet_wrap(~rule) +
+  scale_fill_gradient(low = "#f7fbff", high = "#2171b5", guide = "none") +
+  labs(x = "True result", y = "Predicted result") +
+  theme_minimal(base_size = 9)
+```
+
+```{r}
+#| label: save-results
+saveRDS(list(comparison = comparison,
+             test_metrics = ev$ref,
+             best_params = best_ref, baseline_params = best_base,
+             plain_best_params = k_best_plain,
+             plain_best_test_metrics = ev$plain_best,
+             plain_at_weighted_settings_test_metrics = ev$ref_plain,
+             selection_basis = "Mean training-set validation Macro-F1; no test-based reselection",
+             cv_table = cv$ref$table,
+             sensitivity = sens,
+             plain_best_test_predictions = data.frame(game_id = test$game_id, truth = test$result,
+                                                     pred = pred$plain_best, prob_plain_best),
+             test_predictions = data.frame(game_id = test$game_id, truth = test$result,
+                                           pred = pred$ref, prob_ref)),
+        "outputs/member3_knn_results.rds")
+write.csv(comparison, "outputs/member3_knn_comparison_row.csv", row.names = FALSE)
+```
+
+## Comparison with other members (if their files are present)
+
+Each member saves a comparison row in the same format, so the rows can be stacked directly. Only files already placed in `outputs/` appear here.
+
+```{r}
+#| label: team-compare
+fs <- list.files("outputs", pattern = "^member[0-9]_.*comparison_row\\.csv$", full.names = TRUE)
+allrows <- rbindlist(lapply(fs, fread), fill = TRUE)
+allrows <- allrows[model != "Majority class" | !duplicated(model)]
+tab <- allrows[, .(model, stage, accuracy, balanced_accuracy, macro_f1, recall_draw)]
+tab[, (3:6) := lapply(.SD, f3), .SDcols = 3:6]
+setnames(tab, c("Model", "Stage", "Accuracy", "Balanced Acc.", "Macro-F1", "Recall draw"))
+knitr::kable(tab, caption = "All comparison rows found in outputs/")
+```
+
+# Standard reporting format (plan §9)
+
+```{r}
+#| label: std-report
+r  <- ev$ref$overall
+pc <- ev$ref$per_class
+b  <- ev$base$overall
+```
+
+| Item | kNN |
+|---|---|
+| **Model name** | k-Nearest Neighbours (`FNN::knnx.index`, Euclidean distance, uniform neighbour weights; class shares among the `k` neighbours used as probabilities) |
+| **Features used** | Refined: `table_pos_diff`, `points_per_game_diff`, `form_points_diff`, `recent_goal_diff`, `venue_form_diff`, `h2h_diff`, `rest_days_diff`, `competition_id`, `season_progress` |
+| **Preprocessing applied** | Training-fold median imputation; z-score standardisation with training-fold mean and standard deviation; `competition_id` one-hot (weight `lw` = `r best_ref$lw`); `no_history` flag = `r best_ref$flag`; all estimated on the training fold only |
+| **Baseline result** (Final Test) | Majority class: Accuracy `r f3(ev$majority$overall$accuracy)`, Macro-F1 `r f3(ev$majority$overall$macro_f1)`. Baseline kNN (league + season progress): Accuracy `r f3(b$accuracy)`, Macro-F1 `r f3(b$macro_f1)` |
+| **Best hyperparameters / refinement** | Best within the tested validation grid: `k` = `r best_ref$k`, `lw` = `r best_ref$lw`, `flag` = `r best_ref$flag`; decision weights home/draw/away = 1 / `r best_ref$w_draw` / `r best_ref$w_away` |
+| **Validation Macro-F1** | Weighted final model: `r f3(best_ref$cv_macro_f1)`; plain voting at the same neighbour settings: `r f3(best_ref$cv_macro_f1_plain)`; independently tuned plain voting: `r f3(k_best_plain$cv_macro_f1_plain)` (all means over the same 5 expanding-window folds) |
+| **Independently tuned plain pipeline** | Validation-selected `k` = `r k_best_plain$k`, `lw` = `r k_best_plain$lw`, `flag` = `r k_best_plain$flag`, all class weights = 1; Test Accuracy `r f3(ev$plain_best$overall$accuracy)`, Balanced Accuracy `r f3(ev$plain_best$overall$balanced_accuracy)`, Macro-F1 `r f3(ev$plain_best$overall$macro_f1)`. Supplementary comparison; no test-based model reselection. |
+| **Test Accuracy** | `r f3(r$accuracy)` |
+| **Test Balanced Accuracy** | `r f3(r$balanced_accuracy)` |
+| **Test Macro-F1** | `r f3(r$macro_f1)` |
+| **Home win** P / R / F1 | `r f3(pc$precision[1])` / `r f3(pc$recall[1])` / `r f3(pc$f1[1])` |
+| **Draw** P / R / F1 | `r f3(pc$precision[2])` / `r f3(pc$recall[2])` / `r f3(pc$f1[2])` |
+| **Away win** P / R / F1 | `r f3(pc$precision[3])` / `r f3(pc$recall[3])` / `r f3(pc$f1[3])` |
+| **Confusion matrix** | See the figure above (right panel) |
+
+**Main finding.** On the Final Test set the refined kNN reaches a Macro-F1 of `r f3(r$macro_f1)`, against `r f3(b$macro_f1)` for the context-only kNN and `r f3(ev$majority$overall$macro_f1)` for always predicting a home win, so the refined model is `r if (r$macro_f1 > b$macro_f1) "above" else "not above"` the context-only baseline on the primary metric. At the weighted model's neighbour settings, plain voting gives an accuracy of `r f3(ev$ref_plain$overall$accuracy)` but a draw recall of only `r f3(ev$ref_plain$per_class$recall[2])`. The tuned decision weights, chosen only on the validation folds, change the accuracy to `r f3(r$accuracy)` and the draw recall to `r f3(pc$recall[2])`, which is why Macro-F1 rather than accuracy decides the model choice. The test accuracy of `r f3(r$accuracy)` compares with `r f3(ev$majority$overall$accuracy)` for always predicting a home win on the same seasons.
+
+**Limitation.** kNN has no built-in way to ignore uninformative features, so every standardised feature pulls on the distance equally, including correlated ones, and `k` and the decision weights were chosen on the same five validation seasons, so the validation Macro-F1 is mildly optimistic relative to the test result.

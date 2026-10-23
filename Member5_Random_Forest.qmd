@@ -1,0 +1,375 @@
+---
+title: "Member 5 — Random Forest"
+subtitle: "STAT5003 Assignment 2: Predicting Match Outcomes in Europe's Top Five Leagues"
+author: "Group 2 — Member 5"
+format:
+  html:
+    code-fold: true
+    self-contained: true
+    toc: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(data.table)
+library(ranger)
+library(ggplot2)
+
+source("R/evaluate_model.R")   # shared scoring function (Member 5 deliverable)
+source("R/make_folds.R")       # shared split + fold loader (Member 5 deliverable)
+
+dir.create("outputs", showWarnings = FALSE)
+pct <- function(x, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * x)
+f3  <- function(x) sprintf("%.3f", x)
+```
+
+# Shared infrastructure (Member 5 deliverables)
+
+Besides the Random Forest, Member 5 owns three objects that every member uses, so that the five models are scored in exactly the same way:
+
+| Deliverable | File | Use |
+|---|---|---|
+| Scoring function `evaluate_model(truth, pred)` | `R/evaluate_model.R` | `source()` it; returns Accuracy, Balanced Accuracy, Macro-F1, per-class Precision/Recall/F1 and the confusion matrix. `metrics_row()` turns the result into one row of the comparison table. |
+| Chronological split | `R/make_folds.R` → `load_split()` | Train = seasons 2012–2022, Final Test = seasons 2023–2025. |
+| 5-fold expanding-window folds | `data/cv_folds.rds` | A list of five folds, each holding `train` / `valid` row indices into the training set (and the matching `game_id`s). |
+
+```{r}
+#| label: load-data
+sp    <- load_split()
+train <- sp$train
+test  <- sp$test
+folds <- readRDS("data/cv_folds.rds")
+
+fold_tab <- rbindlist(lapply(folds, function(f) data.table(
+  `Validation season` = sprintf("%d/%02d", f$valid_season, (f$valid_season + 1) %% 100),
+  `Training seasons`  = sprintf("2012/13 – %d/%02d", f$valid_season - 1, f$valid_season %% 100),
+  `Train n` = length(f$train), `Validation n` = length(f$valid))))
+knitr::kable(fold_tab, caption = "Expanding-window folds inside the training set")
+```
+
+The training set holds `r format(nrow(train), big.mark = ",")` matches and the Final Test set holds `r format(nrow(test), big.mark = ",")` matches. Each fold validates on one complete season and trains on every season before it. A validation season is therefore never split, and the model never sees a later season while it is being tuned. The Final Test set is used once, at the end of this document.
+
+**Modelling dataset.** Feature engineering belongs to Member 2. While that file was pending, `R/build_features.R` built `data/model_data.rds` with the exact §2 column names and initial-condition rules: NA on matchday 1, per-match rates, current season only, head-to-head capped at the last 5 meetings, and no imputation. To switch to Member 2's file, change `MODEL_DATA_PATH` in `R/make_folds.R` and re-render; nothing else changes.
+
+# Random Forest
+
+## Features
+
+```{r}
+#| label: features
+baseline_feats <- c("competition_id", "season_progress")
+refined_feats  <- c("table_pos_diff", "points_per_game_diff", "form_points_diff",
+                    "recent_goal_diff", "venue_form_diff", "h2h_diff",
+                    "rest_days_diff", "competition_id", "season_progress")
+
+na_tab <- data.frame(
+  feature   = refined_feats,
+  `NA in train (%)` = round(100 * colMeans(is.na(train[refined_feats])), 2),
+  check.names = FALSE, row.names = NULL)
+knitr::kable(na_tab, caption = "Missingness of the refined features in the training set")
+```
+
+* **Baseline model:** `competition_id` and `season_progress`. This is season context only, with no information about team strength.
+* **Refined model:** all nine §2 features.
+
+None of the banned post-match variables (goals, `aggregate`, club positions, attendance, referee, formations, managers) or the scrape-time `clubs.csv` attributes are used.
+
+## Preprocessing
+
+Random Forest does not need standardisation: each split uses one variable at a time, so the scale of a variable does not matter. Correlated predictors (for example `points_per_game_diff` and `table_pos_diff`) do not need removing either. The only preprocessing is for missing values, and it is **estimated on the training fold only** and then applied unchanged to the validation fold or the test set:
+
+1. For each numeric feature with missing values in the training fold, add a 0/1 indicator column. Where several features share exactly the same missing pattern (all the form and table features are NA on a club's first match), only one indicator is kept. The forest can then tell "no information yet" apart from "evenly matched".
+2. Replace each NA with that feature's **training-fold median**.
+3. `competition_id` is kept as a single factor. Its levels are ordered by home-win rate inside the training fold (`respect.unordered.factors = "order"`), so splits on it are not constrained by an arbitrary alphabetical order.
+
+```{r}
+#| label: preprocessing
+prep_fit <- function(df, feats) {
+  num     <- feats[vapply(df[feats], is.numeric, logical(1))]
+  na_vars <- num[colSums(is.na(df[num])) > 0]
+  ind     <- lapply(df[na_vars], is.na)
+  list(feats    = feats,
+       num      = num,
+       medians  = vapply(df[num], median, numeric(1), na.rm = TRUE),
+       ind_vars = na_vars[!duplicated(ind)])          # one per distinct NA pattern
+}
+
+prep_apply <- function(rec, df) {
+  out <- df[rec$feats]
+  for (v in rec$ind_vars) out[[paste0(v, "_na")]] <- as.integer(is.na(df[[v]]))
+  for (v in rec$num)      out[[v]][is.na(out[[v]])] <- rec$medians[[v]]
+  out
+}
+```
+
+## Handling the draw class
+
+A forest that predicts the most probable class almost never predicts a draw. A draw is rarely the single most likely outcome of a match, even when it is a real possibility. Draw recall then falls close to zero, and so does the draw F1, which pulls down Macro-F1, the plan's primary metric.
+
+So the forest is grown as a **probability forest**, and the class decision is a refinement step tuned on the validation folds. The prediction is the class with the largest *weighted* probability, $\arg\max_k w_k \hat p_k$, with $w_{\text{home}} = 1$ fixed and $(w_{\text{draw}}, w_{\text{away}})$ chosen to maximise mean validation Macro-F1. All weights equal to 1 gives the usual "most probable class" rule, which is reported alongside for comparison.
+
+```{r}
+#| label: rule-helpers
+apply_rule <- function(prob, w = c(1, 1, 1)) {
+  p <- sweep(prob[, RESULT_LEVELS, drop = FALSE], 2, w, `*`)
+  factor(RESULT_LEVELS[max.col(p, ties.method = "first")], levels = RESULT_LEVELS)
+}
+
+weight_grid <- CJ(w_draw = seq(1, 2.2, by = 0.05), w_away = seq(0.8, 1.8, by = 0.05))
+
+# Mean Macro-F1 across folds for every weight pair (scored by evaluate_model)
+score_weights <- function(prob_list, truth_list) {
+  copy(weight_grid)[, cv_macro_f1 := mapply(function(wd, wa) {
+    mean(mapply(function(p, t) evaluate_model(t, apply_rule(p, c(1, wd, wa)))$overall$macro_f1,
+                prob_list, truth_list))
+  }, w_draw, w_away)][]
+}
+
+fit_rf <- function(X, y, mtry, min_node, importance = "none", seed = 5003) {
+  ranger(x = X, y = y, num.trees = 500, mtry = mtry, min.node.size = min_node,
+         probability = TRUE, respect.unordered.factors = "order",
+         importance = importance, seed = seed)
+}
+```
+
+## Hyperparameter tuning (5-fold expanding window)
+
+The two Random Forest hyperparameters tuned are:
+
+* `mtry`, the number of features considered at each split. Small values give more varied, less correlated trees.
+* `min.node.size`, the smallest leaf size. Larger leaves give smoother probabilities and less overfitting, which matters here because match outcomes are very noisy.
+
+`num.trees` is fixed at 500. Beyond a few hundred trees, more trees only reduce Monte-Carlo noise and do not change what the forest has learned. For every combination, each fold's forest is fit on that fold's training seasons, and class probabilities are predicted for its validation season. The decision weights are then tuned on those probabilities.
+
+```{r}
+#| label: cv-tuning
+run_cv <- function(feats, grid) {
+  truth_list <- lapply(folds, function(f) train$result[f$valid])
+  probs <- vector("list", nrow(grid))
+  for (k in seq_along(folds)) {
+    f   <- folds[[k]]
+    rec <- prep_fit(train[f$train, ], feats)
+    Xtr <- prep_apply(rec, train[f$train, ])
+    Xva <- prep_apply(rec, train[f$valid, ])
+    for (g in seq_len(nrow(grid))) {
+      m <- fit_rf(Xtr, train$result[f$train], grid$mtry[g], grid$min_node[g])
+      probs[[g]][[k]] <- predict(m, Xva)$predictions
+    }
+  }
+  res <- lapply(seq_len(nrow(grid)), function(g) {
+    plain <- mean(mapply(function(p, t) evaluate_model(t, apply_rule(p))$overall$macro_f1,
+                         probs[[g]], truth_list))
+    wg <- score_weights(probs[[g]], truth_list)
+    best <- wg[which.max(cv_macro_f1)]
+    data.table(grid[g], cv_macro_f1_plain = plain,
+               w_draw = best$w_draw, w_away = best$w_away,
+               cv_macro_f1 = best$cv_macro_f1)
+  })
+  list(table = rbindlist(res), probs = probs, truth = truth_list)
+}
+
+cv_cache <- "outputs/rf_cv_results.rds"
+data_sig <- tools::md5sum(MODEL_DATA_PATH)
+if (file.exists(cv_cache) && identical(readRDS(cv_cache)$data_sig, data_sig)) {
+  cv <- readRDS(cv_cache)
+} else {
+  base_grid <- CJ(mtry = 1:2, min_node = c(50, 200, 500))
+  ref_grid  <- CJ(mtry = c(1, 2, 3, 4, 6), min_node = c(10, 50, 100, 200, 400))
+  t0 <- Sys.time()
+  cv <- list(base = run_cv(baseline_feats, base_grid),
+             ref  = run_cv(refined_feats,  ref_grid),
+             data_sig = data_sig)
+  cv$minutes <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+  saveRDS(cv, cv_cache)
+}
+
+best_base <- cv$base$table[which.max(cv_macro_f1)]
+best_ref  <- cv$ref$table[which.max(cv_macro_f1)]
+```
+
+```{r}
+#| label: fig-cv-grid
+#| fig-width: 7
+#| fig-height: 3.4
+#| fig-cap: "Validation Macro-F1 (mean of 5 expanding-window folds) for the refined forest, before and after tuning the decision weights."
+cvl <- melt(cv$ref$table, id.vars = c("mtry", "min_node"),
+            measure.vars = c("cv_macro_f1_plain", "cv_macro_f1"),
+            variable.name = "rule", value.name = "macro_f1")
+cvl[, rule := factor(rule, levels = c("cv_macro_f1_plain", "cv_macro_f1"),
+                     labels = c("Most-probable class", "Tuned decision weights"))]
+ggplot(cvl, aes(factor(min_node), factor(mtry), fill = macro_f1)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.3f", macro_f1)), size = 2.6) +
+  facet_wrap(~rule) +
+  scale_fill_gradient(low = "#f7fbff", high = "#2171b5", name = "Macro-F1") +
+  labs(x = "min.node.size", y = "mtry") +
+  theme_minimal(base_size = 9)
+```
+
+```{r}
+#| label: tuning-summary
+tune_tab <- data.frame(
+  Model = c("Baseline RF", "Refined RF"),
+  mtry = c(best_base$mtry, best_ref$mtry),
+  `min.node.size` = c(best_base$min_node, best_ref$min_node),
+  `w_draw` = c(best_base$w_draw, best_ref$w_draw),
+  `w_away` = c(best_base$w_away, best_ref$w_away),
+  `CV Macro-F1 (most-probable)` = f3(c(best_base$cv_macro_f1_plain, best_ref$cv_macro_f1_plain)),
+  `CV Macro-F1 (tuned weights)` = f3(c(best_base$cv_macro_f1, best_ref$cv_macro_f1)),
+  check.names = FALSE)
+knitr::kable(tune_tab, caption = "Selected hyperparameters (best mean validation Macro-F1)")
+```
+
+```{r}
+#| label: tuning-numbers
+rt <- cv$ref$table
+not10 <- rt[min_node > 10]
+```
+
+Two things stand out.
+
+1. **The forest's own hyperparameters matter little.** With tuned weights, every combination with `min.node.size` above 10 scores between `r f3(min(not10$cv_macro_f1))` and `r f3(max(not10$cv_macro_f1))`. Only the smallest leaf size (10) is clearly worse, at `r f3(max(rt[min_node == 10]$cv_macro_f1))` or below: with tiny leaves the trees memorise individual results, which are mostly noise. The selected values are `mtry` = `r best_ref$mtry` and `min.node.size` = `r best_ref$min_node`, but most neighbouring settings would do almost as well.
+2. **The decision rule matters much more.** The most-probable-class rule reaches at best `r f3(max(rt$cv_macro_f1_plain))`. Raising the draw weight to `r best_ref$w_draw` and the away weight to `r best_ref$w_away` lifts validation Macro-F1 to `r f3(best_ref$cv_macro_f1)`.
+
+The weights and hyperparameters were chosen on the same five folds, so the validation Macro-F1 is slightly optimistic. The untouched Final Test set below gives the honest estimate.
+
+## Final fit and Final Test evaluation
+
+The selected configurations are refit on the **whole training set** (2012/13–2022/23). The preprocessing is re-estimated on that set, and each forest predicts the Final Test seasons once.
+
+```{r}
+#| label: final-fit
+final_model <- function(feats, best, importance = "none") {
+  rec <- prep_fit(train, feats)
+  m   <- fit_rf(prep_apply(rec, train), train$result, best$mtry, best$min_node,
+                importance = importance)
+  prob <- predict(m, prep_apply(rec, test))$predictions
+  list(model = m, rec = rec, prob = prob)
+}
+
+fm_base <- final_model(baseline_feats, best_base)
+fm_ref  <- final_model(refined_feats,  best_ref, importance = "permutation")
+
+pred <- list(
+  majority     = factor(rep("home_win", nrow(test)), levels = RESULT_LEVELS),
+  base         = apply_rule(fm_base$prob, c(1, best_base$w_draw, best_base$w_away)),
+  ref_plain    = apply_rule(fm_ref$prob),
+  ref          = apply_rule(fm_ref$prob,  c(1, best_ref$w_draw,  best_ref$w_away)))
+
+ev <- lapply(pred, function(p) evaluate_model(test$result, p))
+
+comparison <- rbind(
+  metrics_row(ev$majority,  "Majority class", "Always home_win"),
+  metrics_row(ev$base,      "Random Forest",  "Baseline (league + season progress)"),
+  metrics_row(ev$ref_plain, "Random Forest",  "Refined, most-probable class"),
+  metrics_row(ev$ref,       "Random Forest",  "Refined, tuned decision weights (final)"))
+
+show <- comparison[, c("stage", "accuracy", "balanced_accuracy", "macro_f1",
+                       "recall_home_win", "recall_draw", "recall_away_win")]
+show[-1] <- lapply(show[-1], f3)
+names(show) <- c("Model", "Accuracy", "Balanced Acc.", "Macro-F1",
+                 "Recall home", "Recall draw", "Recall away")
+knitr::kable(show, caption = "Final Test set (seasons 2023/24 – 2025/26)")
+```
+
+```{r}
+#| label: per-class
+pc <- ev$ref$per_class
+pc_show <- data.frame(Class = c("Home win", "Draw", "Away win"),
+                      Precision = f3(pc$precision), Recall = f3(pc$recall),
+                      F1 = f3(pc$f1), Support = pc$support, Predicted = pc$predicted)
+knitr::kable(pc_show, caption = "Refined Random Forest (final): per-class results on the Final Test set")
+```
+
+```{r}
+#| label: fig-confusion
+#| fig-width: 7
+#| fig-height: 3.2
+#| fig-cap: "Confusion matrices on the Final Test set. Left: most-probable-class rule. Right: final model with tuned decision weights. Cells show counts and the share of each true class."
+lab <- c(home_win = "Home win", draw = "Draw", away_win = "Away win")
+cm_dt <- rbind(
+  data.table(as.data.frame(ev$ref_plain$confusion), rule = "Most-probable class"),
+  data.table(as.data.frame(ev$ref$confusion),       rule = "Tuned decision weights (final)"))
+cm_dt[, share := Freq / sum(Freq), by = .(rule, Truth)]
+cm_dt[, `:=`(Truth = factor(lab[as.character(Truth)], levels = lab),
+             Predicted = factor(lab[as.character(Predicted)], levels = rev(lab)))]
+ggplot(cm_dt, aes(Truth, Predicted, fill = share)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%d\n(%.0f%%)", Freq, 100 * share)), size = 2.8) +
+  facet_wrap(~rule) +
+  scale_fill_gradient(low = "#f7fbff", high = "#2171b5", guide = "none") +
+  labs(x = "True result", y = "Predicted result") +
+  theme_minimal(base_size = 9)
+```
+
+## Feature importance
+
+Permutation importance measures how much the forest's out-of-bag accuracy falls when one feature's values are randomly shuffled. A feature the forest relies on loses a lot; an irrelevant one loses almost nothing.
+
+```{r}
+#| label: fig-importance
+#| fig-width: 6
+#| fig-height: 3.6
+#| fig-cap: "Permutation importance of the refined Random Forest (fitted on the full training set)."
+imp <- data.table(feature = names(fm_ref$model$variable.importance),
+                  importance = fm_ref$model$variable.importance)
+imp[, feature := factor(feature, levels = imp[order(importance)]$feature)]
+ggplot(imp, aes(importance, feature)) +
+  geom_col(fill = "#2171b5") +
+  labs(x = "Mean decrease in accuracy when permuted", y = NULL) +
+  theme_minimal(base_size = 9)
+```
+
+```{r}
+#| label: importance-text
+imp_ord <- imp[order(-importance)]
+top3 <- as.character(imp_ord$feature[1:3])
+```
+
+The forest relies mainly on **`r top3[1]`**, **`r top3[2]`** and **`r top3[3]`**: summaries of how strong each team has been this season. The context-only variables (`competition_id`, `season_progress`) and the missingness indicators contribute little. This matches the EDA finding that league identity barely changes the outcome mix (Cramér's V = 0.021).
+
+```{r}
+#| label: save-results
+saveRDS(list(comparison = comparison,
+             test_metrics = ev$ref,
+             best_params = best_ref, baseline_params = best_base,
+             cv_table = cv$ref$table,
+             importance = imp_ord,
+             test_predictions = data.frame(game_id = test$game_id, truth = test$result,
+                                           pred = pred$ref, fm_ref$prob)),
+        "outputs/member5_rf_results.rds")
+write.csv(comparison, "outputs/member5_rf_comparison_row.csv", row.names = FALSE)
+```
+
+# Standard reporting format (plan §9)
+
+```{r}
+#| label: std-report
+r  <- ev$ref$overall
+pc <- ev$ref$per_class
+b  <- ev$base$overall
+```
+
+| Item | Random Forest |
+|---|---|
+| **Model name** | Random Forest (`ranger`, probability forest, 500 trees) |
+| **Features used** | Refined: `table_pos_diff`, `points_per_game_diff`, `form_points_diff`, `recent_goal_diff`, `venue_form_diff`, `h2h_diff`, `rest_days_diff`, `competition_id`, `season_progress` |
+| **Preprocessing applied** | Training-fold median imputation + missing-value indicators (one per distinct NA pattern); `competition_id` as a factor ordered within the training fold; no scaling (not needed for trees) |
+| **Baseline result** (Final Test) | Majority class: Accuracy `r f3(ev$majority$overall$accuracy)`, Macro-F1 `r f3(ev$majority$overall$macro_f1)`. Baseline RF (league + season progress): Accuracy `r f3(b$accuracy)`, Macro-F1 `r f3(b$macro_f1)` |
+| **Best hyperparameters / refinement** | `mtry` = `r best_ref$mtry`, `min.node.size` = `r best_ref$min_node`, `num.trees` = 500; decision weights home/draw/away = 1 / `r best_ref$w_draw` / `r best_ref$w_away` |
+| **Validation Macro-F1** | `r f3(best_ref$cv_macro_f1)` (mean of 5 expanding-window folds; `r f3(best_ref$cv_macro_f1_plain)` without decision weights) |
+| **Test Accuracy** | `r f3(r$accuracy)` |
+| **Test Balanced Accuracy** | `r f3(r$balanced_accuracy)` |
+| **Test Macro-F1** | `r f3(r$macro_f1)` |
+| **Home win** P / R / F1 | `r f3(pc$precision[1])` / `r f3(pc$recall[1])` / `r f3(pc$f1[1])` |
+| **Draw** P / R / F1 | `r f3(pc$precision[2])` / `r f3(pc$recall[2])` / `r f3(pc$f1[2])` |
+| **Away win** P / R / F1 | `r f3(pc$precision[3])` / `r f3(pc$recall[3])` / `r f3(pc$f1[3])` |
+| **Confusion matrix** | See the figure above (right panel) |
+
+**Main finding.** With pre-match strength and form features, the Random Forest reaches a test Macro-F1 of `r f3(r$macro_f1)`, against `r f3(b$macro_f1)` for the context-only baseline forest and `r f3(ev$majority$overall$macro_f1)` for always predicting a home win. The team-strength features therefore carry real signal, led by `r top3[1]` and `r top3[2]`; the context-only forest has no real signal and, once its weights push it towards draws and away wins, its accuracy (`r f3(b$accuracy)`) drops below always predicting a home win. For the refined forest, the most-probable-class rule gives the highest accuracy (`r f3(ev$ref_plain$overall$accuracy)`) but rarely predicts a draw (draw recall `r f3(ev$ref_plain$per_class$recall[2])`). The tuned decision weights, chosen only on the validation folds, give up some accuracy (`r f3(r$accuracy)`) in exchange for a draw recall of `r f3(pc$recall[2])` and the best Macro-F1.
+
+**Limitation.** Draws remain hard to identify (draw F1 `r f3(pc$f1[2])`), because nothing available before kick-off clearly separates a draw from a narrow win. The decision weights and hyperparameters were also chosen on the same five validation seasons, so the validation Macro-F1 is mildly optimistic relative to the test result.
