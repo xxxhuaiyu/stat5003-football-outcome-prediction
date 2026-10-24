@@ -254,13 +254,15 @@ Confusion matrices are used diagnostically to show not only how often a model is
 
 ## 4.2 Model Performance Comparison
 
-<```{r}
+```{r}
 #| label: final-comparison
 library(data.table); library(knitr)
+
 rows <- rbindlist(lapply(
   list.files("outputs", pattern = "member._.*comparison_row\\.csv$",
              full.names = TRUE), fread), fill = TRUE)
 final <- rows[grepl("final", stage, ignore.case = TRUE)][order(-macro_f1)]
+
 kable(final[, .(Model = model,
                 Accuracy = sprintf("%.3f", accuracy),
                 `Balanced Acc.` = sprintf("%.3f", balanced_accuracy),
