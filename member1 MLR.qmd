@@ -7,22 +7,28 @@ format:
     self-contained: TRUE
 ---
 
-# Introduction
+# 1. Introduction and Problem Statement / Motivation
+
+## 1.1 Project Background and Motivation
 
 Football results are difficult to predict. A stronger team may be more likely to win, but injuries, tactics, home advantage and random events during a match can still change the result. Even so, pre-match data may contain useful patterns. This project investigates whether those patterns can be used to classify a match as a **home win**, **draw**, or **away win** across Europe's top five domestic leagues.
 
-The main research question is: **How accurately can football match outcomes be classified using only information available before kick-off?** We compare five classification methods using the same engineered features and the same chronological split. This makes the comparison fair and ensures that differences in performance come from the models rather than different versions of the data. Accuracy alone is not enough here because a model can score reasonably well by predicting home wins too often. Draws are less common and are especially easy to miss, so Macro-F1 is used as the main selection metric. Accuracy, balanced accuracy, class-level precision, recall and F1, together with confusion matrices, provide additional detail.
+## 1.2 Research Question
+
+The main research question is: **To what extent can pre-match team and match characteristics classify football match outcomes in Europe's top five domestic leagues as a home win, draw, or away win?** We compare five classification methods using the same engineered features and the same chronological split. This makes the comparison fair and ensures that differences in performance come from the models rather than different versions of the data. Accuracy alone is not enough here because a model can score reasonably well by predicting home wins too often. Draws are less common and are especially easy to miss, so Macro-F1 is used as the main selection metric. Accuracy, balanced accuracy, class-level precision, recall and F1, together with confusion matrices, provide additional detail.
 
 
-# Framing & Dataset Selection
+## 1.3 Data Source and Study Scope
 
-The dataset contains 25,241 matches from the top divisions of England, Spain, Italy, France and Germany. It covers the 2012/13 to 2025/26 seasons. The response variable is `result`, with three possible values: `home_win`, `draw` and `away_win`. Home wins are the largest class in the data, while draws are the smallest. For this reason, the models need to be assessed across all three outcomes instead of using overall accuracy by itself.
+The dataset contains 25,241 matches from the top divisions of England, Spain, Italy, France and Germany, covering the 2012/13 to 2025/26 seasons. The response variable is `result`, classified as `home_win`, `draw` or `away_win`. Because home wins are the largest class and draws the smallest, model performance is assessed across all three outcomes rather than by accuracy alone.
 
-Only information that would be available before a match was considered. The predictors describe the difference between the two teams in league position, season points per game, recent points, recent goal difference, home and away form, head-to-head record and rest days. League and season progress are also included to account for the wider match context. Form and league-table features are calculated from earlier matches in the same season. Head-to-head form uses no more than the five most recent meetings played before the fixture.
+The predictors use only information available before kick-off, including differences in league position, season points per game, recent form, recent goal difference, venue form, head-to-head history and rest days, together with league and season progress. Post-match goals, aggregate scores and supplied club positions were excluded to prevent leakage, while attendance, referee, formation, manager and snapshot club attributes were omitted because they were unavailable before kick-off, inconsistently recorded or historically inaccurate.
 
-Some original variables could not be used. Match goals and aggregate score directly reveal the result, so including them would create target leakage. The supplied club-position fields were also removed after the EDA showed that they represented standings after the match. Attendance, referee, formation and manager information were excluded because they were either unavailable before kick-off or recorded inconsistently. The attributes in `clubs.csv` were not used in the main models either. They are a single snapshot of each club and do not describe how the squad looked in every historical season.
+The analysis uses a chronological split: matches from 2012/13 to 2022/23 form the training set, while 2023/24 to 2025/26 form the untouched Final Test. Five expanding-window folds within the training period support tuning and model selection, with each validation season predicted using only earlier seasons. This design reflects the practical task of forecasting future matches and prevents future information from entering model development.
 
-The data were split by time rather than at random. Matches from 2012/13 to 2022/23 form the training set, and the 2023/24 to 2025/26 seasons are kept as the Final Test. Within the training period, five expanding-window folds are used for tuning and model selection. Each validation season is predicted using only earlier seasons. This is closer to the real task, where future match data would not be available when making a prediction.
+# 2. Exploratory Data Analysis
+
+## 2.1 Outcome Distribution
 
 ```{r}
 #| label: outcome-distribution
@@ -35,14 +41,16 @@ outcome_table$Percentage <- sprintf(
 knitr::kable(outcome_table, caption = "Match outcomes in the modelling dataset")
 ```
 
-# Consider & Gather Data
+## 2.2 Data Quality and Missing Values
+
+<!-- Insert the final missing-value summary and explain the data-quality decisions used in modelling. -->
 
 
 ```{r} 
 # R code
 ```
 
-# Exploratory Data Analysis (EDA) 
+## 2.3 Predictor Relationships and Key Patterns
 
 Useful numerical and graphical outputs should be shown in the report with code folded. 
 
@@ -57,9 +65,27 @@ ggplot(mtcars, aes(x = wt, y = mpg)) +
        y = "Miles per Gallon")
 ```
 
-# Project Planning
+## 2.4 Implications for Modelling
 
-## Multinomial Logistic Regression
+<!-- Summarise how the EDA informed feature engineering, the chronological split and the choice of Macro-F1. -->
+
+# 3. Model Implementation Details
+
+## 3.1 Feature Engineering
+
+<!-- Insert the agreed feature-engineering description and final predictor set. -->
+
+## 3.2 Preprocessing Strategy
+
+<!-- Insert the shared missing-value, scaling, encoding and collinearity treatment. -->
+
+## 3.3 Data Splitting and Validation Strategy
+
+<!-- Insert the chronological split, Final Test period, expanding-window validation folds and leakage controls. -->
+
+## 3.4 Classification Models
+
+### 3.4.1 Multinomial Logistic Regression
 
 Multinomial logistic regression (MLR) was fitted to predict **home win**, **draw**, or **away win**. The context-only baseline used `competition_id` and `season_progress`; the refined candidates added pre-match league position, season points per game, recent form, recent goal difference, venue form, head-to-head history and rest-day differences. Variables known only after kick-off were excluded.
 
@@ -80,6 +106,8 @@ mlr <- readRDS("outputs/member1_mlr_results.rds")
 f3 <- function(x) sprintf("%.3f", x)
 ```
 
+**Hyperparameter Tuning**
+
 Several refined specifications were compared because the strength and form measures were correlated. Each feature set was tested with coefficient-decay values of 0, 0.0001, 0.001, 0.01, 0.1 and 1. The ordinary largest-probability decision rule almost never predicted a draw, so draw and away-win probability weights were also tuned using validation predictions only. Mean validation Macro-F1 determined the final specification.
 
 ```{r}
@@ -99,6 +127,8 @@ kable(tuning_table,
 ```
 
 The selected model excluded `venue_form_diff`, used decay 0.1, and applied home/draw/away decision weights of 1.0/2.0/1.4. It achieved mean validation Macro-F1 of 0.462. The exclusion of venue form was based on future-season validation performance rather than correlation alone.
+
+**Final Test Results and Interpretation**
 
 ```{r}
 #| label: mlr-test-results
@@ -152,13 +182,64 @@ ggplot(cm_data, aes(Truth, Predicted, fill = Share)) +
 
 The MLR shows that pre-match strength and form carry useful predictive information beyond league and season context. Its main limitation is that linear log-odds cannot automatically capture complex nonlinear relationships or interactions. Draws also remain intrinsically difficult to distinguish from narrow wins with the available predictors.
 
+### 3.4.2 Linear Discriminant Analysis
+
+<!-- Member 2: Insert the concise LDA implementation, tuning, results and limitation. -->
+
+### 3.4.3 k-Nearest Neighbours
+
+<!-- Member 3: Insert the concise kNN implementation, tuning, results and limitation. -->
+
+### 3.4.4 Support Vector Machine
+
+<!-- Member 4: Insert the concise SVM implementation, tuning, results and limitation. -->
+
+### 3.4.5 Random Forest
+
+<!-- Member 5: Insert the concise Random Forest implementation, tuning, results and limitation. -->
+
+## 3.5 Hyperparameter Tuning
+
+<!-- Consolidate and compare the tuning choices for all five models. The detailed MLR tuning is retained within Section 3.4.1. -->
+
+# 4. Model Evaluation and Selection
+
+## 4.1 Evaluation Metrics
+
+<!-- Insert the shared definitions and justification for Accuracy, Balanced Accuracy, Macro-F1 and class-level metrics. -->
+
+## 4.2 Model Performance Comparison
+
+<!-- Insert one unified comparison table or figure for the five final models. -->
+
+## 4.3 Final Model Selection
+
+<!-- Justify the selected final model using validation design, Final Test metrics, class performance and interpretability. -->
+
+## 4.4 Process Reflection
+
+<!-- Explain how the Data Investigation Process structured the workflow and what the group would do differently next time. -->
+
+# 5. Conclusion and Insights
+
+## 5.1 Answer to the Research Question
+
+<!-- Directly answer the research question using the final model results. -->
+
+## 5.2 Key Insights
+
+<!-- Summarise the most important empirical and practical findings. -->
+
+## 5.3 Limitations and Future Improvements
+
+<!-- Summarise the main data and modelling limitations and propose feasible improvements. -->
 
 
-# References
+# 6. References
 
 List all the references used throughout the report using APA7 Style.
 
-## AI Use Statment
+# 7. AI Use Statement
 If applicable,
 
 I acknowledge the use of [AI tool + version, publisher and URL] to generate [summary of what was generated].
