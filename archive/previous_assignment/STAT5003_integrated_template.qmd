@@ -325,11 +325,124 @@ Decision weighting raised Macro-F1 from 0.361 to 0.423 and draw recall from 0.08
 
 ### 3.4.5 Random Forest
 
-<!-- Member 5: Insert the concise Random Forest implementation, tuning, results and limitation. -->
+A Random Forest (`ranger`, 500 trees) averages many decision trees grown on bootstrap samples, each split choosing from a random subset of features. It is the only ensemble, non-parametric model in the comparison: it assumes no functional form and can capture interactions. Splits use one variable at a time, so no standardisation was needed, and all nine features were kept despite the correlated pairs in Section 2.3. Within each training fold, NAs were replaced by fold medians, with one 0/1 indicator per distinct missingness pattern so the forest can distinguish "no history yet" from "evenly matched". A probability forest was grown so that decision weights could be applied to its class probabilities.
+
+```{r}
+#| label: rf-load
+library(data.table); library(knitr); library(ggplot2)
+# Full fitting and tuning pipeline: Member5_Random_Forest.qmd
+rf_res <- readRDS("outputs/member5_rf_results.rds")
+f3 <- function(x) sprintf("%.3f", x)
+rf_cv  <- as.data.table(rf_res$cv_table)
+rf_bp  <- rf_res$best_params
+rf_big <- rf_cv[min_node >= 50]          # leaves of at least 50 matches
+```
+
+**Hyperparameter tuning.** `mtry` (features tried per split) was searched over {1, 2, 3, 4, 6} and `min.node.size` (smallest leaf) over {10, 50, 100, 200, 400}, with decision weights tuned for each combination. The selected forest uses **mtry `r rf_bp$mtry`, min.node.size `r rf_bp$min_node`** and home/draw/away weights 1 / `r rf_bp$w_draw` / `r rf_bp$w_away`, giving a validation Macro-F1 of `r f3(rf_bp$cv_macro_f1)`. The surface was flat: all combinations with leaves of at least 50 matches scored `r f3(min(rf_big$cv_macro_f1))`–`r f3(max(rf_big$cv_macro_f1))`. Only very small leaves, which memorise individual results, did worse.
+
+```{r}
+#| label: rf-test
+rf_cmp <- as.data.table(rf_res$comparison)[model == "Random Forest"]
+kable(rf_cmp[, .(Stage = stage, Accuracy = f3(accuracy),
+                 `Balanced Acc.` = f3(balanced_accuracy),
+                 `Macro-F1` = f3(macro_f1), `Recall: Draw` = f3(recall_draw))],
+      caption = "Random Forest performance on the Final Test")
+```
+
+```{r}
+#| label: rf-test-values
+rf_fin   <- rf_cmp[grepl("final", stage)]
+rf_plain <- rf_cmp[grepl("most-probable", stage)]
+rf_pc    <- rf_res$test_metrics$per_class
+```
+
+Weighting trades accuracy (`r f3(rf_plain$accuracy)` → `r f3(rf_fin$accuracy)`) for draw recall (`r f3(rf_plain$recall_draw)` → `r f3(rf_fin$recall_draw)`). Final class F1: home `r f3(rf_pc$f1[1])`, draw `r f3(rf_pc$f1[2])`, away `r f3(rf_pc$f1[3])`.
+
+```{r}
+#| label: fig-rf-importance
+#| fig-width: 6
+#| fig-height: 2.3
+#| fig-cap: "Random Forest permutation importance: the drop in out-of-bag accuracy when one feature is shuffled (training data only)."
+imp <- as.data.table(rf_res$importance)
+imp[, feature := as.character(feature)]
+labels <- c(points_per_game_diff = "Season points per game",
+            table_pos_diff = "League table position",
+            recent_goal_diff = "Recent goal difference",
+            h2h_diff = "Head-to-head record",
+            form_points_diff = "Recent points (last 5)",
+            venue_form_diff = "Home / away venue form",
+            season_progress = "Season progress",
+            rest_days_diff = "Rest days",
+            competition_id = "League")
+imp_plot <- rbind(imp[feature %in% names(labels), .(label = labels[feature], importance)],
+                  data.table(label = "Missingness indicators (all)",
+                             importance = imp[grepl("_na$", feature), sum(importance)]))
+imp_plot[, label := factor(label, levels = label[order(importance)])]
+ggplot(imp_plot, aes(100 * importance, label)) +
+  geom_col(fill = "#2166ac") +
+  geom_text(aes(label = sprintf("%.1f", 100 * importance)), hjust = -0.2, size = 2.8) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(x = "Accuracy lost when shuffled (percentage points)", y = NULL) +
+  theme_minimal(base_size = 9)
+```
+
+Season-long strength dominates. Shuffling the points-per-game gap costs 3.4 percentage points of accuracy, twice any other feature, followed by table position and recent goal difference. League contributes nothing, consistent with the EDA.
+
+**Limitation.** Permutation importance measures predictive reliance, not causal effect. It also splits credit between correlated features (`points_per_game_diff` and `table_pos_diff`, r = 0.90), understating the combined weight of season strength.
 
 ## 3.5 Hyperparameter Tuning
 
-<!-- Consolidate and compare the tuning choices for all five models. The detailed MLR tuning is retained within Section 3.4.1. -->
+All five models were tuned on the same five expanding-window folds by mean validation Macro-F1, in two stages: model-specific hyperparameters, then draw and away-win decision weights on the class probabilities ($\arg\max_k w_k \hat p_k$, home weight 1). The Final Test played no part in tuning.
+
+```{r}
+#| label: tuning-summary
+library(data.table); library(knitr)
+f3 <- function(x) sprintf("%.3f", x)
+mlr_t <- readRDS("outputs/member1_mlr_results.rds")
+lda_t <- readRDS("outputs/member2_lda_results.rds")
+knn_t <- readRDS("outputs/member3_knn_results.rds")
+svm_t <- readRDS("outputs/member4_svm_results.rds")
+rf_t  <- readRDS("outputs/member5_rf_results.rds")
+
+mlr_cv  <- as.data.table(mlr_t$cv_table)[order(-cv_macro_f1)][1]
+lda_cv  <- as.data.table(lda_t$cv_table)
+lda_pl  <- lda_cv[w_draw == 1 & w_away == 1]$cv_macro_f1
+kb <- knn_t$best_params; sb <- svm_t$best; sw <- svm_t$best_weights; rb <- rf_t$best_params
+
+tune_tab <- data.table(
+  Model = c("Multinomial logistic regression", "LDA", "kNN", "SVM (RBF)", "Random Forest"),
+  `Hyperparameters searched` = c(
+    "Feature set; decay {0, 10⁻⁴, …, 1}",
+    "None (redundant features dropped per fold)",
+    "k {5, …, 501}; league weight {0.3, 1}; no-history flag",
+    "Kernel; cost {1, 4, 16}; gamma {0.15, 0.3, 0.6}",
+    "mtry {1, 2, 3, 4, 6}; min.node.size {10, …, 400}"),
+  Selected = c(
+    sprintf("No venue form; decay %g", mlr_t$best_decay),
+    "—",
+    sprintf("k = %d; weight %g; flag on", kb$k, kb$lw),
+    sprintf("cost %g; gamma %g", sb$cost, sb$gamma),
+    sprintf("mtry %d; min.node %d", rb$mtry, rb$min_node)),
+  `Weights (draw / away)` = c(
+    sprintf("%.2f / %.2f", mlr_t$decision_weights[["draw"]], mlr_t$decision_weights[["away_win"]]),
+    sprintf("%.2f / %.2f", lda_t$best_params$w_draw, lda_t$best_params$w_away),
+    sprintf("%.2f / %.2f", kb$w_draw, kb$w_away),
+    sprintf("%.2f / %.2f", sw$w_draw, sw$w_away),
+    sprintf("%.2f / %.2f", rb$w_draw, rb$w_away)),
+  `Val. Macro-F1: unweighted → weighted` = c(
+    paste(f3(mlr_cv$cv_macro_f1_plain), "→", f3(mlr_cv$cv_macro_f1)),
+    paste(f3(lda_pl), "→", f3(lda_t$best_params$cv_macro_f1)),
+    paste(f3(kb$cv_macro_f1_plain), "→", f3(kb$cv_macro_f1)),
+    paste(f3(sb$cv_macro_f1), "→", f3(sw$cv_macro_f1)),
+    paste(f3(rb$cv_macro_f1_plain), "→", f3(rb$cv_macro_f1))))
+kable(tune_tab, caption = "Tuning choices and validation Macro-F1 for the five refined models")
+```
+
+- **Hyperparameters mattered little.** Surfaces were flat: MLR decay from 0 to 1 changes validation Macro-F1 by under 0.001, and Random Forest varies by about 0.004 once leaves hold 50+ matches. Where settings mattered, smoother options won (very large k, large leaves), as expected for a weak, noisy signal.
+- **Decision weights mattered most.** Unweighted, the models rarely predict draws (validation Macro-F1 0.37–0.40). The weights add 0.03–0.09, and all five converged on similar values (draw 1.70–2.00, away 1.25–1.50), which points to a shared problem: a draw is seldom the most probable outcome.
+- **Grid boundaries.** The SVM grid was extended until its optimum was interior. The kNN optimum (k = `r kb$k`) lies on its grid's upper edge, so a larger k might help slightly. The grid was not extended after the test results were seen.
+
+Choosing settings and weights on the same folds makes validation scores mildly optimistic; Section 4 reports the unbiased test results.
 
 # 4. Model Evaluation and Selection
 
@@ -377,17 +490,50 @@ Two things would be done differently. Feature engineering was assigned as a bloc
 
 # 5. Conclusion and Insights
 
+```{r}
+#| label: conclusion-values
+library(data.table)
+pct <- function(x) sprintf("%.1f%%", 100 * x)
+f3  <- function(x) sprintf("%.3f", x)
+all_rows <- rbindlist(lapply(
+  list.files("outputs", pattern = "member._.*comparison_row\\.csv$", full.names = TRUE),
+  fread), fill = TRUE)
+fin  <- all_rows[grepl("final", stage, ignore.case = TRUE)][order(-macro_f1)]
+best <- fin[1]
+maj  <- all_rows[model == "Majority class"][1]
+ctx  <- all_rows[grepl("^Baseline", stage)]          # league + season progress only
+
+# Random Forest test-set probabilities by season points-per-game gap
+rf_c <- readRDS("outputs/member5_rf_results.rds")
+tp   <- merge(as.data.table(rf_c$test_predictions),
+              as.data.table(readRDS("data/model_data.rds"))[, .(game_id, points_per_game_diff)],
+              by = "game_id")
+even <- tp[points_per_game_diff > -0.25 & points_per_game_diff <= 0.25]
+fav  <- tp[points_per_game_diff > 1.25]
+```
+
 ## 5.1 Answer to the Research Question
 
-<!-- Directly answer the research question using the final model results. -->
+Pre-match characteristics classify match outcomes **partially**: clearly better than simple rules, but far from reliably. The selected model, `r best$model`, classifies `r pct(best$accuracy)` of 2023/24–2025/26 matches correctly with Macro-F1 `r f3(best$macro_f1)`. Always predicting a home win gives `r pct(maj$accuracy)` and `r f3(maj$macro_f1)`, and no model using only league and season progress exceeds `r f3(max(ctx$macro_f1))`. All five refined models fall within `r f3(min(fin$macro_f1))`–`r f3(max(fin$macro_f1))`, so the conclusion does not depend on the method. Predictability is uneven across outcomes. Home and away wins are separated moderately well (`r best$model` F1 `r f3(best$f1_home_win)` and `r f3(best$f1_away_win)`), but draws are not (draw F1 `r f3(min(fin$f1_draw))`–`r f3(max(fin$f1_draw))` across models). Pre-match information explains part of a result; much of it remains unpredictable before kick-off.
 
 ## 5.2 Key Insights
 
-<!-- Summarise the most important empirical and practical findings. -->
+1. **Season-long strength carries most of the signal.** Season points per game and table position lead the Random Forest importance, and table position has one of LDA's two largest discriminant weights. Five-match form adds less, and league adds nothing. A season-to-date average is a steadier measure of quality than a short, noisy run of results.
+2. **The decision rule mattered more than the algorithm.** Re-weighting raised each model's test Macro-F1 by 0.03–0.08 (Random Forest: 0.383 to 0.451), while the four leading algorithms differ by only `r f3(fin$macro_f1[1] - fin$macro_f1[4])`.
+3. **Draws are hard for a structural reason.** For evenly matched teams (points-per-game gap within ±0.25), the forest's average draw probability is `r pct(mean(even$draw))`, close to the observed `r pct(mean(even$truth == "draw"))`. A home win is still more likely (`r pct(mean(even$home_win))` predicted, `r pct(mean(even$truth == "home_win"))` observed). A draw is almost never the most likely outcome, so predicting draws costs 2–5 percentage points of accuracy.
+4. **The outputs are most useful as probabilities.** Predicted probabilities track observed frequencies. When the home side leads by more than 1.25 points per game, the forest predicts a `r pct(mean(fav$home_win))` home-win chance against `r pct(mean(fav$truth == "home_win"))` observed. For analysts and media, the models give dependable likelihoods for clear favourites but little separation in close match-ups.
 
 ## 5.3 Limitations and Future Improvements
 
-<!-- Summarise the main data and modelling limitations and propose feasible improvements. -->
+**Data.** Club attributes are a single present-day snapshot and were excluded, so the models have no time-accurate measure of squad quality, injuries or transfers. Early-season matches have little history and were median-imputed, so predictions near matchday 1 are close to average. The training period also includes the 2020 no-crowd seasons, when home advantage temporarily fell.
+
+**Modelling.** The features measure the *difference* between teams, not how *even* a match is, which is the main reason draws remain hard. No formal significance test was run, so the small gaps between the top four models are treated as ties rather than a ranking.
+
+**Future improvements.**
+
+- Add evenness features from the existing data, such as the absolute strength gap and each team's recent draw rate, and test whether draw F1 improves.
+- Replace snapshot attributes with a time-varying rating, such as an Elo-style rating updated from past results only.
+- Fit an ordinal model (away win < draw < home win), which places the draw explicitly between the two wins, and compare models with a paired test such as McNemar's test.
 
 
 # 6. References
