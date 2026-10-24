@@ -270,6 +270,7 @@ kable(final[, .(Model = model,
                 `Recall: Draw` = sprintf("%.3f", recall_draw))],
       caption = "Final test-set performance of all five models (5,256 matches)")
 ```
+
 LDA achieved the highest Macro-F1 at 0.463, followed by multinomial logistic regression (0.457), kNN (0.453) and random forest (0.451), with the SVM behind at 0.423. The ranking is metric-dependent: kNN was the most accurate model (0.486) but third on Macro-F1, while LDA was third on accuracy. Every model exceeded the majority-class Macro-F1 of 0.201 by a wide margin while improving accuracy by only four to six percentage points, showing that the gain is concentrated in the minority classes rather than in overall correctness. Draw recall ranges from 0.218 to 0.375 across the five models, confirming that draws remain the limiting class for all of them regardless of method.
 
 ## 4.3 Final Model Selection
