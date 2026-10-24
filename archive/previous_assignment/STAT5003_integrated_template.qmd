@@ -192,7 +192,46 @@ The MLR shows that pre-match strength and form carry useful predictive informati
 
 ### 3.4.4 Support Vector Machine
 
-<!-- Member 4: Insert the concise SVM implementation, tuning, results and limitation. -->
+A support vector machine classifies by maximising the margin between classes, a different inductive bias from the probabilistic, linear, instance-based and ensemble methods above, which makes it a useful point of contrast. Two preprocessing steps were required that the tree-based models did not need: the RBF kernel is distance-based, so all numeric predictors were standardised, and `svm()` cannot accept missing values, so matchday-1 rows were median-imputed. Both were fitted inside each training fold.
+
+```{r}
+#| label: svm-load
+library(data.table); library(knitr)
+# Full fitting and tuning pipeline: Member4_SVM.qmd
+svm_res <- readRDS("outputs/member4_svm_results.rds")
+f3 <- function(x) sprintf("%.3f", x)
+```
+
+**Hyperparameter tuning.** Kernel choice was treated as a tuning decision rather than an assumption: a linear kernel was compared with an RBF kernel on the same five validation folds. Cost and gamma were then tuned by grid search. The first grid's optimum fell on its boundary, so the grid was extended until the optimum sat in the interior. Because kernel SVM training scales roughly quadratically with sample size, single-fit runtime was measured on 1,000, 2,000 and 4,000 rows before committing to a grid; the observed scaling confirmed the full grid was affordable on the largest fold of 18,159 matches.
+
+```{r}
+#| label: svm-tuning
+cv  <- as.data.table(svm_res$cv_rbf)
+lin <- as.data.table(svm_res$cv_linear)
+kable(rbind(
+  data.table(Kernel = "Linear", Cost = lin[which.max(cv_macro_f1)]$cost,
+             Gamma = NA_real_,
+             `Validation Macro-F1` = f3(max(lin$cv_macro_f1))),
+  cv[order(-cv_macro_f1)][1:3, .(Kernel = "RBF", Cost = cost, Gamma = gamma,
+             `Validation Macro-F1` = f3(cv_macro_f1))]),
+  caption = "Best linear kernel and top three RBF configurations on the validation folds")
+```
+
+The RBF kernel was retained, consistent with the EDA finding that no single feature separates the three outcome classes linearly. The selected configuration was **cost 4, gamma 0.3**, with decision weights of 1 / `r svm_res$best_weights$w_draw` / `r svm_res$best_weights$w_away` tuned on the same folds.
+
+```{r}
+#| label: svm-test
+cmp <- as.data.table(svm_res$comparison)
+kable(cmp[!grepl("predict\\(\\)", stage),
+          .(Stage = stage, Accuracy = f3(accuracy),
+            `Balanced Accuracy` = f3(balanced_accuracy),
+            `Macro-F1` = f3(macro_f1))],
+      caption = "SVM performance on the Final Test")
+```
+
+Decision weighting raised Macro-F1 from 0.361 to 0.423 and draw recall from 0.085 to 0.218, at a cost of 3.6 percentage points of accuracy — the same trade-off observed for the other four models.
+
+**Limitation.** Class probabilities from `e1071::svm` are obtained by Platt scaling fitted after training rather than directly from the model. This limited how much decision-weight tuning could improve minority-class recall relative to a probabilistic classifier such as LDA, and is the main reason the SVM finished behind the other four models on Macro-F1.
 
 ### 3.4.5 Random Forest
 
@@ -206,19 +245,42 @@ The MLR shows that pre-match strength and form carry useful predictive informati
 
 ## 4.1 Evaluation Metrics
 
-<!-- Insert the shared definitions and justification for Accuracy, Balanced Accuracy, Macro-F1 and class-level metrics. -->
+Four metrics are reported for every model, computed by a single shared scoring function on the same 5,256-match Final Test so that differences reflect model behaviour rather than differences in measurement.
+Macro-F1 is the primary metric and determines the final model choice. Accuracy alone is unsuitable for this problem: always predicting a home win achieves 43.0% accuracy while scoring zero on two of the three outcomes. Macro-F1 averages the F1 score across all three classes equally, so a model that abandons draws — the minority class at 25% of matches — is penalised rather than rewarded. This was decided before any model was fitted.
+Accuracy is reported as a supporting measure because it is the most intuitive summary and allows direct comparison against the majority-class reference of 0.430.
+Balanced accuracy, the mean of the three class recalls, provides a second imbalance-robust view and is unaffected by how often each class is predicted.
+Class-level precision, recall and F1 are reported for home wins, draws and away wins separately, since the aggregate metrics conceal which outcomes a model handles well. Draw recall in particular proved decisive: before decision weighting, several models identified almost no draws despite achieving reasonable accuracy.
+Confusion matrices are used diagnostically to show not only how often a model is wrong but in which direction, which Section 4.3 draws on when comparing the final candidates.
 
 ## 4.2 Model Performance Comparison
 
-<!-- Insert one unified comparison table or figure for the five final models. -->
+<```{r}
+#| label: final-comparison
+library(data.table); library(knitr)
+rows <- rbindlist(lapply(
+  list.files("outputs", pattern = "member._.*comparison_row\\.csv$",
+             full.names = TRUE), fread), fill = TRUE)
+final <- rows[grepl("final", stage, ignore.case = TRUE)][order(-macro_f1)]
+kable(final[, .(Model = model,
+                Accuracy = sprintf("%.3f", accuracy),
+                `Balanced Acc.` = sprintf("%.3f", balanced_accuracy),
+                `Macro-F1` = sprintf("%.3f", macro_f1),
+                `Recall: Draw` = sprintf("%.3f", recall_draw))],
+      caption = "Final test-set performance of all five models (5,256 matches)")
+```
+LDA achieved the highest Macro-F1 at 0.463, followed by multinomial logistic regression (0.457), kNN (0.453) and random forest (0.451), with the SVM behind at 0.423. The ranking is metric-dependent: kNN was the most accurate model (0.486) but third on Macro-F1, while LDA was third on accuracy. Every model exceeded the majority-class Macro-F1 of 0.201 by a wide margin while improving accuracy by only four to six percentage points, showing that the gain is concentrated in the minority classes rather than in overall correctness. Draw recall ranges from 0.218 to 0.375 across the five models, confirming that draws remain the limiting class for all of them regardless of method.
 
 ## 4.3 Final Model Selection
 
-<!-- Justify the selected final model using validation design, Final Test metrics, class performance and interpretability. -->
+The four leading models differ by only 0.012 in Macro-F1 across 5,256 matches, a margin too small to attribute confidently to genuine differences in model quality. These four are therefore treated as equivalent on predictive performance; only the SVM can be separated on results alone, and the reason for its weaker showing is documented in Section 3.4.4.
+LDA is selected as the final model. Where predictive performance is equivalent, selection must rest on other grounds, and LDA is the strongest on each. It is the most interpretable of the candidates, since each predictor enters through a single discriminant coefficient whose sign and magnitude can be read directly. It is the cheapest to train, with no hyperparameters requiring a search. And it estimates class probabilities directly from the model rather than deriving them afterwards, which made decision-weight tuning more effective for it than for the SVM, where Platt-scaled probabilities limited the achievable gain. Claiming a clear winner on a 0.006 margin would overstate what the evidence supports; choosing the simplest model among equals is the defensible conclusion.
+Class-level performance supports this reading. LDA recovers 33% of draws with 30% precision, while identifying 58% of home wins and 47% of away wins. No model in the comparison handles draws well, and the pattern is consistent across all five despite their differing assumptions, which points to the feature set rather than the choice of algorithm as the binding constraint.
 
 ## 4.4 Process Reflection
 
-<!-- Explain how the Data Investigation Process structured the workflow and what the group would do differently next time. -->
+The Data Investigation Process shaped this project most visibly at the exploration stage. Two forms of target leakage were identified before any model was fitted: the supplied league position columns record standings after each match, and the club attribute fields are a single present-day snapshot rather than values contemporaneous with each fixture. Had modelling begun directly from the raw data, the project would have reported substantially inflated results built on information unavailable before kick-off. The sequencing of the process — explore, then engineer, then model — is what surfaced both.
+Fixing the shared infrastructure before any modelling began proved equally important. Agreeing the chronological split, the validation folds and a single scoring function in advance meant that five models, fitted independently by five people, could be compared without re-running anything or reconciling differing definitions.
+Two things would be done differently. Feature engineering was assigned as a blocking deliverable but was not completed on schedule and was eventually built by another member, which delayed every downstream model; a task that the whole team depends on needs a firm date and a named backup. Second, decision-weight tuning was adopted by individual members before the group agreed on it, briefly making the results non-comparable until it was applied uniformly. A refinement that changes the ranking on the primary metric should be a group decision made at the planning stage rather than an individual one discovered during comparison.
 
 # 5. Conclusion and Insights
 
