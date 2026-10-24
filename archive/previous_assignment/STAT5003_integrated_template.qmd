@@ -7,6 +7,17 @@ format:
     self-contained: TRUE
 ---
 
+```{r}
+#| label: setup-paths
+#| include: false
+# This file lives in archive/previous_assignment/, but every data/ R/ and
+# outputs/ path below is written relative to the repository root (matching
+# every other .qmd in this project). Move the working directory up two
+# levels so those paths resolve no matter where this file is rendered from
+# (RStudio's Render button, `quarto render`, or a GitHub Action).
+knitr::opts_knit$set(root.dir = normalizePath(file.path(getwd(), "..", "..")))
+```
+
 # 1. Introduction and Problem Statement / Motivation
 
 ## 1.1 Project Background and Motivation
@@ -43,31 +54,56 @@ knitr::kable(outcome_table, caption = "Match outcomes in the modelling dataset")
 
 ## 2.2 Data Quality and Missing Values
 
-<!-- Insert the final missing-value summary and explain the data-quality decisions used in modelling. -->
+```{r}
+#| label: fig-missingness
+#| fig-cap: "Missing values among the engineered pre-match features."
+library(data.table)
+library(ggplot2)
 
+feat_cols <- c("table_pos_diff", "points_per_game_diff", "form_points_diff",
+               "recent_goal_diff", "venue_form_diff", "h2h_diff", "rest_days_diff")
+miss <- sapply(model_data[feat_cols], function(x) sum(is.na(x)))
+miss_dt <- data.table(feature = names(miss), share = miss / nrow(model_data))
+miss_dt <- miss_dt[share > 0]
 
-```{r} 
-# R code
+ggplot(miss_dt, aes(reorder(feature, share), share)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = NULL, y = "Share missing") +
+  theme_minimal()
 ```
+
+Missingness is modest and concentrated in features that depend on match history: `h2h_diff` is missing for 10.0% of matches (a club's first meeting) and `venue_form_diff` for 5.7%; the rest are under 3%. No feature exceeds 10% missing, so every model uses training-fold median imputation plus a missingness indicator rather than dropping rows, keeping the full 25,241-match sample.
 
 ## 2.3 Predictor Relationships and Key Patterns
 
-Useful numerical and graphical outputs should be shown in the report with code folded. 
+```{r}
+#| label: fig-corr-eda
+#| fig-width: 6
+#| fig-height: 5
+#| fig-cap: "Correlation between the seven engineered differential features."
+diff_feats <- c("table_pos_diff", "points_per_game_diff", "form_points_diff",
+                "recent_goal_diff", "venue_form_diff", "h2h_diff", "rest_days_diff")
+cor_mat <- cor(model_data[diff_feats], use = "pairwise.complete.obs")
+cor_long <- as.data.table(as.table(cor_mat))
+setnames(cor_long, c("Var1", "Var2", "r"))
 
-```{r} 
-library(ggplot2)
-
-ggplot(mtcars, aes(x = wt, y = mpg)) +
-  geom_point(aes(color = cyl)) +
-  geom_smooth(method = "lm", formula = y ~ x) +
-  labs(title = "MPG vs. Weight",
-       x = "Weight (1000 lbs)",
-       y = "Miles per Gallon")
+ggplot(cor_long, aes(Var1, Var2, fill = r)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", r)), size = 2.8) +
+  scale_fill_gradient2(low = "#2171b5", mid = "white", high = "#cb181d",
+                       midpoint = 0, limits = c(-1, 1)) +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1)) +
+  labs(x = NULL, y = NULL, fill = "r")
 ```
+
+Several features overlap strongly: `table_pos_diff` and `points_per_game_diff` correlate at r = 0.90, and `form_points_diff` and `recent_goal_diff` at r = 0.88 — each pair captures essentially the same signal measured two ways. LDA inverts a covariance matrix across predictors, so near-duplicate features destabilise its fitted coefficients; the weaker feature in each pair is dropped before fitting LDA (Section 3.4.2). Tree-based models split on one variable at a time and keep all nine features.
 
 ## 2.4 Implications for Modelling
 
-<!-- Summarise how the EDA informed feature engineering, the chronological split and the choice of Macro-F1. -->
+Three EDA findings shaped the LDA model design below: the imbalanced outcome (home win 44.4%, draw 25.1%) motivates Macro-F1 as the primary metric; modest, history-dependent missingness (≤10%) is handled with training-fold median imputation and a missingness indicator rather than dropping rows; and the strong collinearity between several differential features motivates dropping the redundant member of each pair before fitting LDA, which depends on inverting a stable covariance matrix.
 
 # 3. Model Implementation Details
 
@@ -184,7 +220,61 @@ The MLR shows that pre-match strength and form carry useful predictive informati
 
 ### 3.4.2 Linear Discriminant Analysis
 
-<!-- Member 2: Insert the concise LDA implementation, tuning, results and limitation. -->
+Linear Discriminant Analysis (`MASS::lda`) was fitted as a classical linear baseline: it models each outcome class as multivariate-normal around its own mean, sharing one covariance matrix across classes, giving a different modelling assumption to the tree-based methods used elsewhere in the project. The context-only baseline used `competition_id` and `season_progress`; the refined model added the decorrelated pre-match differential features identified in Section 2.3.
+
+Because LDA inverts a pooled covariance matrix across predictors, the near-duplicate features flagged in Section 2.3 were dropped, leaving `table_pos_diff`, `recent_goal_diff`, `venue_form_diff`, `h2h_diff`, `rest_days_diff`, `season_progress` and `competition_id` — re-selected independently inside every cross-validation fold so no later-season information leaks into the choice. Training-fold median imputation, missingness indicators and standardisation were applied before fitting, the same shared preprocessing design as the other models. The equal-covariance assumption was checked descriptively (within-class standard deviations and pairwise correlations are close across classes), offering partial support, though the features are not exactly multivariate-normal.
+
+```{r}
+#| label: lda-load-results
+library(data.table)
+library(knitr)
+lda_res <- readRDS("outputs/member2_lda_results.rds")
+f3 <- function(x) sprintf("%.3f", x)
+```
+
+As with the other models, predicting only the single most probable class rarely predicts a draw, so decision weights (home/draw/away, $\arg\max_k w_k \hat p_k$) were tuned on the five validation folds to maximise mean Macro-F1: the refined model's weights of 1 / 1.85 / 1.25 give a validation Macro-F1 of `r f3(lda_res$best_params$cv_macro_f1)`, against `r f3(lda_res$baseline_params$cv_macro_f1)` for the untuned context-only baseline.
+
+**Final Test Results and Interpretation**
+
+```{r}
+#| label: lda-test-results
+comparison <- as.data.table(lda_res$comparison)
+test_table <- comparison[, .(
+  Model = stage,
+  Accuracy = f3(accuracy),
+  `Macro-F1` = f3(macro_f1),
+  `Recall: Home` = f3(recall_home_win),
+  `Recall: Draw` = f3(recall_draw),
+  `Recall: Away` = f3(recall_away_win)
+)]
+kable(test_table, caption = "Linear Discriminant Analysis results on the Final Test")
+```
+
+On the untouched Final Test set, the refined, weighted LDA reaches **Accuracy 0.483** and **Macro-F1 0.463**, against 0.201 for always predicting a home win. The most-probable-class rule alone gives a higher accuracy (0.510) but never predicts a draw, so the tuned weights trade some accuracy for a draw recall of 0.333 and the best overall Macro-F1. F1 by class: home win 0.585, draw 0.315, away win 0.489.
+
+```{r}
+#| label: lda-confusion-matrix
+#| fig-width: 5
+#| fig-height: 3.5
+#| fig-cap: "Final refined LDA confusion matrix (tuned decision weights). Percentages show recall within each true outcome."
+class_labels <- c(home_win = "Home win", draw = "Draw", away_win = "Away win")
+cm_data <- as.data.table(as.data.frame(lda_res$test_metrics$confusion))
+cm_data[, Share := Freq / sum(Freq), by = Truth]
+cm_data[, Truth := factor(class_labels[as.character(Truth)], levels = class_labels)]
+cm_data[, Predicted := factor(class_labels[as.character(Predicted)],
+                              levels = rev(class_labels))]
+
+ggplot(cm_data, aes(Truth, Predicted, fill = Share)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%d\n(%.0f%%)", Freq, 100 * Share)), size = 3) +
+  scale_fill_gradient(low = "#f7fbff", high = "#2166ac", guide = "none") +
+  theme_minimal(base_size = 9) +
+  labs(x = "True result", y = "Predicted result")
+```
+
+`table_pos_diff` and `h2h_diff` carry the largest standardised LD1 discriminant weights, consistent with Random Forest's leading features (Section 3.4.5).
+
+**Limitation.** As with every model tried, the draw class is hardest to separate: the engineered differentials capture relative team strength, not the closeness that produces a draw, and LDA's linear decision boundary is a further simplification on top of that.
 
 ### 3.4.3 k-Nearest Neighbours
 
