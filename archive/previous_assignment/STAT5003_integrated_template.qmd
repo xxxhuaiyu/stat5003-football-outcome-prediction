@@ -109,15 +109,70 @@ Three EDA findings shaped the LDA model design below: the imbalanced outcome (ho
 
 ## 3.1 Feature Engineering
 
-<!-- Insert the agreed feature-engineering description and final predictor set. -->
+Nine **pre-match** predictors were used: seven measures of relative team strength or match history, league and season progress. Post-match statistics and unreliable snapshot attributes were excluded to avoid leakage.
+
+| Predictor | Construction and interpretation |
+|---|---|
+| `table_pos_diff` | Away minus home league position, reconstructed from earlier results; positive values favour the home team. |
+| `points_per_game_diff` | Home minus away season-to-date points per match. |
+| `form_points_diff` | Home minus away average points over each team's previous up to five league matches in the current season. |
+| `recent_goal_diff` | Home minus away average goal difference over the same recent-match window. |
+| `venue_form_diff` | Home team's average points from its previous up to five home matches minus the away team's equivalent away record, within the current season. |
+| `h2h_diff` | Home-team wins minus away-team wins across their previous up to five league meetings, including earlier seasons. |
+| `rest_days_diff` | Home minus away days since the previous fixture in any competition, with each team's rest capped at 30 days. |
+| `competition_id` | League identity, treated as categorical. |
+| `season_progress` | Match round divided by the maximum round for that league and season. |
+
+History-based predictors exclude the current match; unavailable histories remain missing until fold-specific preprocessing. Season strength and recent form capture different time horizons, while venue form, head-to-head results and rest add match context. Club and match identifiers are excluded from the predictors.
+
+```{r}
+#| label: shared-features
+#| include: false
+getwd()
+knitr::opts_knit$get("root.dir")
+file.exists("data/model_data.rds")
+model_features <- c("table_pos_diff", "points_per_game_diff", "form_points_diff",
+                    "recent_goal_diff", "venue_form_diff", "h2h_diff",
+                    "rest_days_diff", "competition_id", "season_progress")
+stopifnot(all(c("result", "season", model_features) %in% names(model_data)))
+```
 
 ## 3.2 Preprocessing Strategy
 
-<!-- Insert the shared missing-value, scaling, encoding and collinearity treatment. -->
+Missing numerical values were replaced with **training-fold medians**, with missingness indicators where appropriate. Distance-based models used training-fold z-score scaling and one-hot league encoding; kNN additionally tuned the league weight and optional `no_history` flag. LDA removed redundant correlated predictors, while tree models retained them. All transformations were fitted within each training fold and applied unchanged to validation/test data.
+
+Median imputation retains early-season matches whose histories are incomplete. For kNN, the optional `no_history` indicator marks missing season points-per-game differences, distinguishing unavailable league history from an imputed average value. Standardisation prevents variables measured on larger scales, such as rest days, from dominating Euclidean distance. One-hot encoding represents league membership without imposing a numerical ordering. The league columns and binary history indicator are not z-scored. Medians, means and standard deviations are estimated separately in each training fold; validation observations never contribute to these estimates. The selected pipeline is then fitted again on the full training period before application to the Final Test.
+
+```{r}
+#| label: shared-preprocessing-check
+#| include: false
+# Inspect data quality without altering the shared dataset or fitting on test data.
+missing_rate <- colMeans(is.na(model_data[model_features]))
+stopifnot(all(is.finite(missing_rate)), all(missing_rate >= 0))
+# Model-specific fold-fitted transformations are implemented in model pipelines.
+```
 
 ## 3.3 Data Splitting and Validation Strategy
 
-<!-- Insert the chronological split, Final Test period, expanding-window validation folds and leakage controls. -->
+The shared chronological split used **2012/13–2022/23** for training and **2023/24–2025/26** for Final Test. Five expanding-window folds (validation seasons 2018/19–2022/23) selected settings by mean **Macro-F1**. Test data were held out from tuning, and only pre-kick-off features were used.
+
+Chronological validation reflects the intended task of predicting later matches from earlier observations. A random split would mix earlier and later seasons and give a less representative assessment of future-season performance. The first fold trains on 2012/13–2017/18 and validates on 2018/19; each subsequent fold adds one season, ending with validation on 2022/23. The same folds and scoring function are shared across models, making their validation results comparable. Validation outcomes guide configuration selection, while the held-out seasons assess performance after selection.
+
+```{r}
+#| label: shared-split-check
+#| include: false
+cv_folds_shared <- readRDS("data/cv_folds.rds")
+
+valid_seasons <- sort(unname(vapply(
+  cv_folds_shared, `[[`, numeric(1), "valid_season"
+)))
+
+stopifnot(
+  length(cv_folds_shared) == 5L,
+  identical(valid_seasons, as.numeric(2018:2022)),
+  all(2012:2025 %in% unique(model_data$season))
+)
+```
 
 ## 3.4 Classification Models
 
@@ -278,7 +333,60 @@ ggplot(cm_data, aes(Truth, Predicted, fill = Share)) +
 
 ### 3.4.3 k-Nearest Neighbours
 
-<!-- Member 3: Insert the concise kNN implementation, tuning, results and limitation. -->
+kNN estimated match-outcome probabilities from the `k` closest historical matches using scaled Euclidean distance. The baseline used league and season progress; the refined model used all nine predictors. Five expanding-window folds selected `k`, league weight, the optional `no_history` flag and draw/away decision weights by mean Macro-F1.
+
+Each class probability is its proportion among the selected neighbours, with equal weight per neighbour. Small values of `k` follow local variation closely, whereas larger values smooth over noisy individual results. The context-only baseline tests whether team-strength and history features add information beyond league and season timing. Predictions use the largest weighted class probability, with the home-win weight fixed at one and the draw and away-win weights chosen using validation results.
+
+```{r}
+#| label: knn-load
+# Full training and CV pipeline: Member3_kNN.qmd
+knn_path <- "outputs/member3_knn_results.rds"
+if (!file.exists(knn_path)) stop("Missing ", knn_path, "; run Member3_kNN.qmd first.")
+knn_res <- readRDS(knn_path)
+knn_cv <- as.data.table(knn_res$cv_table)
+knn_bp <- knn_res$best_params
+```
+
+**Hyperparameter tuning.** The search covered `k` = 5–501, league weights 0.3/1, and inclusion/exclusion of `no_history`; decision weights were tuned on validation predictions. The top three settings were:
+
+```{r}
+#| label: knn-tuning
+knitr::kable(
+  knn_cv[order(-cv_macro_f1)][1:min(3, .N),
+    .(k, League_weight = lw, No_history = flag,
+      `CV Macro-F1` = sprintf("%.3f", cv_macro_f1))],
+  caption = "Top kNN settings on five validation folds")
+```
+
+The selected setting was **k = `r knn_bp$k`**, league weight **`r knn_bp$lw`**, with draw/away weights **`r sprintf("%.2f / %.2f", knn_bp$w_draw, knn_bp$w_away)`** (validation Macro-F1 **`r sprintf("%.3f", knn_bp$cv_macro_f1)`**).
+
+```{r}
+#| label: knn-test
+knn_cmp <- as.data.table(knn_res$comparison)
+knitr::kable(
+  knn_cmp[, .(Stage = stage, Accuracy = sprintf("%.3f", accuracy),
+              `Macro-F1` = sprintf("%.3f", macro_f1),
+              `Draw recall` = sprintf("%.3f", recall_draw))],
+  caption = "kNN performance on the Final Test")
+```
+
+The refined kNN achieved Final Test Macro-F1 of 0.453, compared with 0.331 for the context-only baseline, indicating that pre-match strength and history added predictive information. At the weighted model's selected neighbour settings, plain voting achieved accuracy 0.508 but predicted no draws. Decision weighting increased draw recall to 0.244 and Macro-F1 from 0.376 to 0.453, while reducing accuracy to 0.486. This trade-off supports selection by Macro-F1: the final model recognises all three outcomes more evenly, although it still misses most draws. The independently tuned plain-voting pipeline is a separate supplementary comparison, added after the original test results were inspected; it did not determine the designated final model.
+
+```{r}
+#| label: knn-confusion
+#| fig-width: 5.6
+#| fig-height: 3.0
+#| fig-cap: "Final refined kNN confusion matrix (counts)."
+knn_cm <- as.data.table(as.data.frame(knn_res$test_metrics$confusion))
+ggplot(knn_cm, aes(Truth, Predicted, fill = Freq)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = Freq), size = 3.4) +
+  scale_fill_gradient(low = "#f7fbff", high = "#2171b5", guide = "none") +
+  labs(x = "True outcome", y = "Predicted outcome") +
+  theme_minimal(base_size = 9)
+```
+
+**Limitation.** Correlated predictors can count similar strength information more than once in Euclidean distance. The selected `k` reached the upper search boundary, so it is the best value within the tested grid rather than a demonstrated global optimum. Choosing neighbour settings and decision weights on the same validation folds can also make validation Macro-F1 optimistic. Draws remain difficult to identify despite weighting, suggesting limited separation with the available predictors.
 
 ### 3.4.4 Support Vector Machine
 
