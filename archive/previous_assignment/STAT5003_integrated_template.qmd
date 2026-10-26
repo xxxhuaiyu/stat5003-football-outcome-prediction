@@ -1,21 +1,41 @@
 ---
 title: "STAT5003 Assignment Title"
-author: "Your group number"
+author: "Group 2"
 format:
   html:
     code-fold: true
     self-contained: TRUE
 ---
 
+<style>
+table {
+  width: 78%;
+  margin-left: auto;
+  margin-right: auto;
+  font-size: 0.82em;
+}
+
+table th,
+table td {
+  padding: 0.3rem 0.45rem;
+}
+</style>
+
 ```{r}
 #| label: setup-paths
 #| include: false
 # This file lives in archive/previous_assignment/, but every data/ R/ and
-# outputs/ path below is written relative to the repository root (matching
-# every other .qmd in this project). Move the working directory up two
-# levels so those paths resolve no matter where this file is rendered from
-# (RStudio's Render button, `quarto render`, or a GitHub Action).
+# outputs/ path below is written relative to the repository root. Move the
+# working directory up two levels so those paths resolve when rendered here.
 knitr::opts_knit$set(root.dir = normalizePath(file.path(getwd(), "..", "..")))
+
+# Keep figures compact throughout the report.
+knitr::opts_chunk$set(
+  fig.width = 6,
+  fig.height = 4,
+  out.width = "62%",
+  fig.align = "center"
+)
 ```
 
 # 1. Introduction and Problem Statement / Motivation
