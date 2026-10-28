@@ -1,5 +1,5 @@
 ---
-title: "STAT5003 Assignment Title"
+title: "Predicting Football Match Outcomes in Europe’s Top Five Domestic Leagues Using Pre-Match Information"
 author: "Group 2"
 format:
   html:
@@ -9,24 +9,25 @@ format:
 
 <style>
 table {
-  width: 78%;
+  width: 68%;
   margin-left: auto;
   margin-right: auto;
-  font-size: 0.82em;
+  font-size: 0.72em;
+  line-height: 1.15;
 }
 
 table th,
 table td {
-  padding: 0.3rem 0.45rem;
+  padding: 0.18rem 0.3rem;
 }
 </style>
 
 ```{r}
-#| label: setup-paths
+#| label: setup-report
 #| include: false
-# This file lives in archive/previous_assignment/, but every data/ R/ and
-# outputs/ path below is written relative to the repository root. Move the
-# working directory up two levels so those paths resolve when rendered here.
+
+# The report is stored two levels below the repository root. Use the root so
+# data/, R/ and outputs/ paths resolve when the file is rendered in place.
 knitr::opts_knit$set(root.dir = normalizePath(file.path(getwd(), "..", "..")))
 
 # Keep figures compact throughout the report.
@@ -42,7 +43,7 @@ knitr::opts_chunk$set(
 
 ## 1.1 Project Background and Motivation
 
-Football results are difficult to predict. A stronger team may be more likely to win, but injuries, tactics, home advantage and random events during a match can still change the result. Even so, pre-match data may contain useful patterns. This project investigates whether those patterns can be used to classify a match as a **home win**, **draw**, or **away win** across Europe's top five domestic leagues.
+Predicting individual football matches remains difficult because outcomes are shaped by complex interactions and a relatively small number of scoring events (Berrar et al., 2024). A stronger team may be more likely to win, yet injuries, tactics, home advantage and random events can still change the result. Even so, pre-match data may contain useful patterns. This project tests whether those patterns can classify matches in Europe's top five domestic leagues as a **home win**, **draw**, or **away win**, providing evidence-based estimates that may be useful to football analysts, clubs and sports media.
 
 ## 1.2 Research Question
 
@@ -51,11 +52,11 @@ The main research question is: **To what extent can pre-match team and match cha
 
 ## 1.3 Data Source and Study Scope
 
-The dataset contains 25,241 matches from the top divisions of England, Spain, Italy, France and Germany, covering the 2012/13 to 2025/26 seasons. The response variable is `result`, classified as `home_win`, `draw` or `away_win`. Because home wins are the largest class and draws the smallest, model performance is assessed across all three outcomes rather than by accuracy alone.
+The raw data were obtained from the *Football Data from Transfermarkt* dataset on Kaggle (Cariboo, n.d.). This project uses its match and competition records to study fixtures from Europe's top five domestic leagues. After filtering and feature construction, the modelling dataset contains 25,241 matches from England, Spain, Italy, France and Germany between 2012/13 and 2025/26. This large, varied sample supports comparison across leagues and over time. The response, `result`, has three classes: `home_win`, `draw` and `away_win`.
 
-The predictors use only information available before kick-off, including differences in league position, season points per game, recent form, recent goal difference, venue form, head-to-head history and rest days, together with league and season progress. Post-match goals, aggregate scores and supplied club positions were excluded to prevent leakage, while attendance, referee, formation, manager and snapshot club attributes were omitted because they were unavailable before kick-off, inconsistently recorded or historically inaccurate.
+The available match history is detailed enough to construct pre-kick-off measures of league position, points per game, recent form, goal difference, venue form, head-to-head record and rest days. Post-match statistics and supplied club positions were excluded to prevent leakage. Other fields, including attendance, referee, formation, manager and snapshot club attributes, were too incomplete or historically unreliable to use.
 
-The analysis uses a chronological split: matches from 2012/13 to 2022/23 form the training set, while 2023/24 to 2025/26 form the untouched Final Test. Five expanding-window folds within the training period support tuning and model selection, with each validation season predicted using only earlier seasons. This design reflects the practical task of forecasting future matches and prevents future information from entering model development.
+Matches from 2012/13 to 2022/23 form the training set, while 2023/24 to 2025/26 are kept as the untouched Final Test. Five expanding-window folds support model selection, with each validation season predicted from earlier seasons only. This chronological design matches the practical forecasting task and prevents future information from entering model development.
 
 # 2. Exploratory Data Analysis
 
@@ -71,6 +72,8 @@ outcome_table$Percentage <- sprintf(
 )
 knitr::kable(outcome_table, caption = "Match outcomes in the modelling dataset")
 ```
+
+Home wins are the most common result, making up 44.4% of the matches. Away wins account for 30.5%, while draws are the smallest group at 25.1%. The imbalance is not extreme, but it is large enough for accuracy to give a misleading picture if a model predicts home wins too often. For this reason, Macro-F1 is used as the main evaluation metric, since it gives equal weight to performance across all three outcomes.
 
 ## 2.2 Data Quality and Missing Values
 
@@ -159,9 +162,7 @@ stopifnot(all(c("result", "season", model_features) %in% names(model_data)))
 
 ## 3.2 Preprocessing Strategy
 
-Missing numerical values were replaced with **training-fold medians**, with missingness indicators where appropriate. Distance-based models used training-fold z-score scaling and one-hot league encoding; kNN additionally tuned the league weight and optional `no_history` flag. LDA removed redundant correlated predictors, while tree models retained them. All transformations were fitted within each training fold and applied unchanged to validation/test data.
-
-Median imputation retains early-season matches whose histories are incomplete. For kNN, the optional `no_history` indicator marks missing season points-per-game differences, distinguishing unavailable league history from an imputed average value. Standardisation prevents variables measured on larger scales, such as rest days, from dominating Euclidean distance. One-hot encoding represents league membership without imposing a numerical ordering. The league columns and binary history indicator are not z-scored. Medians, means and standard deviations are estimated separately in each training fold; validation observations never contribute to these estimates. The selected pipeline is then fitted again on the full training period before application to the Final Test.
+Missing numerical values were replaced with **training-fold medians** so early-season matches could be retained, with indicators distinguishing unavailable history from average values where appropriate. Distance-based models used training-fold z-score scaling to prevent large-scale variables from dominating and one-hot encoding for league; kNN also tuned league weight and an optional `no_history` flag. LDA removed redundant correlated predictors, whereas tree models retained them. All medians, scaling parameters and encodings were estimated within each training fold, applied unchanged to validation data, and refitted on the full training period only before Final Test prediction, preventing leakage.
 
 ```{r}
 #| label: shared-preprocessing-check
@@ -174,9 +175,7 @@ stopifnot(all(is.finite(missing_rate)), all(missing_rate >= 0))
 
 ## 3.3 Data Splitting and Validation Strategy
 
-The shared chronological split used **2012/13–2022/23** for training and **2023/24–2025/26** for Final Test. Five expanding-window folds (validation seasons 2018/19–2022/23) selected settings by mean **Macro-F1**. Test data were held out from tuning, and only pre-kick-off features were used.
-
-Chronological validation reflects the intended task of predicting later matches from earlier observations. A random split would mix earlier and later seasons and give a less representative assessment of future-season performance. The first fold trains on 2012/13–2017/18 and validates on 2018/19; each subsequent fold adds one season, ending with validation on 2022/23. The same folds and scoring function are shared across models, making their validation results comparable. Validation outcomes guide configuration selection, while the held-out seasons assess performance after selection.
+The shared chronological split used **2012/13–2022/23** for training and **2023/24–2025/26** as the untouched Final Test. Five expanding-window folds validated on seasons 2018/19–2022/23, each using only earlier seasons for training, and selected settings by mean **Macro-F1**. This design reflects genuine future-match prediction, avoids the temporal leakage caused by a random split and, by using identical folds and scoring across all five models, supports a fair comparison. Only pre-kick-off features were used, and the Final Test played no role in tuning.
 
 ```{r}
 #| label: shared-split-check
@@ -196,14 +195,13 @@ stopifnot(
 
 ## 3.4 Classification Models
 
+Following earlier machine-learning research on football forecasting, we compare several classifiers rather than relying on a single modelling approach (Baboota & Kaur, 2019).
+
 ### 3.4.1 Multinomial Logistic Regression
-
-Multinomial logistic regression (MLR) was fitted to predict **home win**, **draw**, or **away win**. The context-only baseline used `competition_id` and `season_progress`; the refined candidates added pre-match league position, season points per game, recent form, recent goal difference, venue form, head-to-head history and rest-day differences. Variables known only after kick-off were excluded.
-
-All models used the shared chronological design: seasons through 2022/23 formed the training period and 2023/24–2025/26 formed the untouched Final Test. Five expanding-window folds within training were used for model selection. In every fold, missing-value medians, missingness indicators and standardisation parameters were estimated from the training portion only and then applied unchanged to its validation season. `competition_id` was retained as a factor.
 
 ```{r}
 #| label: mlr-load-results
+#| include: false
 library(data.table)
 library(knitr)
 
@@ -217,118 +215,23 @@ mlr <- readRDS("outputs/member1_mlr_results.rds")
 f3 <- function(x) sprintf("%.3f", x)
 ```
 
-**Hyperparameter Tuning**
-
-Several refined specifications were compared because the strength and form measures were correlated. Each feature set was tested with coefficient-decay values of 0, 0.0001, 0.001, 0.01, 0.1 and 1. The ordinary largest-probability decision rule almost never predicted a draw, so draw and away-win probability weights were also tuned using validation predictions only. Mean validation Macro-F1 determined the final specification.
-
-```{r}
-#| label: mlr-tuning
-cv <- as.data.table(mlr$cv_table)
-best_by_set <- cv[order(-cv_macro_f1), .SD[1], by = feature_set]
-tuning_table <- best_by_set[, .(
-  `Feature set` = feature_set,
-  Decay = decay,
-  `Plain Macro-F1` = f3(cv_macro_f1_plain),
-  `Draw weight` = w_draw,
-  `Away weight` = w_away,
-  `Weighted Macro-F1` = f3(cv_macro_f1)
-)]
-kable(tuning_table,
-      caption = "Best validation result for each MLR feature set")
-```
-
-The selected model excluded `venue_form_diff`, used decay 0.1, and applied home/draw/away decision weights of 1.0/2.0/1.4. It achieved mean validation Macro-F1 of 0.462. The exclusion of venue form was based on future-season validation performance rather than correlation alone.
-
-**Final Test Results and Interpretation**
-
-```{r}
-#| label: mlr-test-results
-comparison <- as.data.table(mlr$comparison)
-test_table <- comparison[, .(
-  Model = stage,
-  Accuracy = f3(accuracy),
-  `Balanced Accuracy` = f3(balanced_accuracy),
-  `Macro-F1` = f3(macro_f1),
-  `Recall: Home` = f3(recall_home_win),
-  `Recall: Draw` = f3(recall_draw),
-  `Recall: Away` = f3(recall_away_win)
-)]
-kable(test_table, caption = "Multinomial logistic regression results on the Final Test")
-```
-
-```{r}
-#| label: mlr-per-class-results
-per_class <- as.data.table(mlr$test_metrics$per_class)
-per_class_table <- per_class[, .(
-  Class = c("Home win", "Draw", "Away win"),
-  Precision = f3(precision),
-  Recall = f3(recall),
-  F1 = f3(f1)
-)]
-kable(per_class_table,
-      caption = "Class-specific performance of the final multinomial logistic regression")
-```
-
-The ordinary refined MLR reached accuracy 0.510 but almost never predicted draws, resulting in Macro-F1 of 0.380. The validation-tuned decision rule reduced accuracy to 0.468 but increased draw recall to 0.375 and achieved test Macro-F1 of 0.457. Its class F1 scores were 0.558 for home wins, 0.326 for draws and 0.487 for away wins. Under the pre-specified primary metric, the weighted version was therefore selected because it provided more balanced performance across the three outcomes.
-
-```{r}
-#| label: mlr-confusion-matrix
-#| fig-width: 5
-#| fig-height: 3.5
-#| fig-cap: "Final refined MLR confusion matrix. Percentages show recall within each true outcome."
-class_labels <- c(home_win = "Home win", draw = "Draw", away_win = "Away win")
-cm_data <- as.data.table(as.data.frame(mlr$test_metrics$confusion))
-cm_data[, Share := Freq / sum(Freq), by = Truth]
-cm_data[, Truth := factor(class_labels[as.character(Truth)], levels = class_labels)]
-cm_data[, Predicted := factor(class_labels[as.character(Predicted)],
-                              levels = rev(class_labels))]
-
-ggplot(cm_data, aes(Truth, Predicted, fill = Share)) +
-  geom_tile(colour = "white") +
-  geom_text(aes(label = sprintf("%d\n(%.0f%%)", Freq, 100 * Share)), size = 3) +
-  scale_fill_gradient(low = "#f7fbff", high = "#2166ac", guide = "none") +
-  theme_minimal(base_size = 9) +
-  labs(x = "True result", y = "Predicted result")
-```
-
-The MLR shows that pre-match strength and form carry useful predictive information beyond league and season context. Its main limitation is that linear log-odds cannot automatically capture complex nonlinear relationships or interactions. Draws also remain intrinsically difficult to distinguish from narrow wins with the available predictors.
+MLR models the log-odds of the three outcomes as linear functions of the pre-match predictors, providing a simple and interpretable baseline. The final specification excluded `venue_form_diff`, used a decay of 0.1 and applied home/draw/away decision weights of 1.0/2.0/1.4. On the Final Test it achieved accuracy 0.468 and Macro-F1 0.457; draw recall rose to 0.375, although this came at the cost of some overall accuracy. The model therefore shows that team strength and form contain useful information, but its linear structure cannot capture more complex interactions, and draws remain difficult to separate from narrow wins.
 
 ### 3.4.2 Linear Discriminant Analysis
 
-Linear Discriminant Analysis (`MASS::lda`) was fitted as a classical linear baseline: it models each outcome class as multivariate-normal around its own mean, sharing one covariance matrix across classes, giving a different modelling assumption to the tree-based methods used elsewhere in the project. The context-only baseline used `competition_id` and `season_progress`; the refined model added the decorrelated pre-match differential features identified in Section 2.3.
-
-Because LDA inverts a pooled covariance matrix across predictors, the near-duplicate features flagged in Section 2.3 were dropped, leaving `table_pos_diff`, `recent_goal_diff`, `venue_form_diff`, `h2h_diff`, `rest_days_diff`, `season_progress` and `competition_id` — re-selected independently inside every cross-validation fold so no later-season information leaks into the choice. Training-fold median imputation, missingness indicators and standardisation were applied before fitting, the same shared preprocessing design as the other models. The equal-covariance assumption was checked descriptively (within-class standard deviations and pairwise correlations are close across classes), offering partial support, though the features are not exactly multivariate-normal.
-
 ```{r}
 #| label: lda-load-results
+#| include: false
 library(data.table)
 library(knitr)
 lda_res <- readRDS("outputs/member2_lda_results.rds")
 f3 <- function(x) sprintf("%.3f", x)
 ```
 
-As with the other models, predicting only the single most probable class rarely predicts a draw, so decision weights (home/draw/away, $\arg\max_k w_k \hat p_k$) were tuned on the five validation folds to maximise mean Macro-F1: the refined model's weights of 1 / 1.85 / 1.25 give a validation Macro-F1 of `r f3(lda_res$best_params$cv_macro_f1)`, against `r f3(lda_res$baseline_params$cv_macro_f1)` for the untuned context-only baseline.
-
-**Final Test Results and Interpretation**
+LDA models each outcome around a class mean while sharing one covariance matrix, so highly correlated predictors were removed before fitting. The final model used seven decorrelated predictors and home/draw/away decision weights of 1/1.85/1.25. It produced the strongest Final Test Macro-F1, 0.463, with accuracy 0.483 and draw recall 0.333; `table_pos_diff` and `h2h_diff` had the largest discriminant weights. Its assumptions are only approximate, however. The boundary is linear, the predictors are not perfectly multivariate-normal and, as the confusion matrix shows, draws are still the least distinct outcome.
 
 ```{r}
-#| label: lda-test-results
-comparison <- as.data.table(lda_res$comparison)
-test_table <- comparison[, .(
-  Model = stage,
-  Accuracy = f3(accuracy),
-  `Macro-F1` = f3(macro_f1),
-  `Recall: Home` = f3(recall_home_win),
-  `Recall: Draw` = f3(recall_draw),
-  `Recall: Away` = f3(recall_away_win)
-)]
-kable(test_table, caption = "Linear Discriminant Analysis results on the Final Test")
-```
-
-On the untouched Final Test set, the refined, weighted LDA reaches **Accuracy 0.483** and **Macro-F1 0.463**, against 0.201 for always predicting a home win. The most-probable-class rule alone gives a higher accuracy (0.510) but never predicts a draw, so the tuned weights trade some accuracy for a draw recall of 0.333 and the best overall Macro-F1. F1 by class: home win 0.585, draw 0.315, away win 0.489.
-
-```{r}
-#| label: lda-confusion-matrix
+#| label: fig-lda-confusion-matrix
 #| fig-width: 5
 #| fig-height: 3.5
 #| fig-cap: "Final refined LDA confusion matrix (tuned decision weights). Percentages show recall within each true outcome."
@@ -347,18 +250,11 @@ ggplot(cm_data, aes(Truth, Predicted, fill = Share)) +
   labs(x = "True result", y = "Predicted result")
 ```
 
-`table_pos_diff` and `h2h_diff` carry the largest standardised LD1 discriminant weights, consistent with Random Forest's leading features (Section 3.4.5).
-
-**Limitation.** As with every model tried, the draw class is hardest to separate: the engineered differentials capture relative team strength, not the closeness that produces a draw, and LDA's linear decision boundary is a further simplification on top of that.
-
 ### 3.4.3 k-Nearest Neighbours
-
-kNN estimated match-outcome probabilities from the `k` closest historical matches using scaled Euclidean distance. The baseline used league and season progress; the refined model used all nine predictors. Five expanding-window folds selected `k`, league weight, the optional `no_history` flag and draw/away decision weights by mean Macro-F1.
-
-Each class probability is its proportion among the selected neighbours, with equal weight per neighbour. Small values of `k` follow local variation closely, whereas larger values smooth over noisy individual results. The context-only baseline tests whether team-strength and history features add information beyond league and season timing. Predictions use the largest weighted class probability, with the home-win weight fixed at one and the draw and away-win weights chosen using validation results.
 
 ```{r}
 #| label: knn-load
+#| include: false
 # Full training and CV pipeline: Member3_kNN.qmd
 knn_path <- "outputs/member3_knn_results.rds"
 if (!file.exists(knn_path)) stop("Missing ", knn_path, "; run Member3_kNN.qmd first.")
@@ -367,96 +263,26 @@ knn_cv <- as.data.table(knn_res$cv_table)
 knn_bp <- knn_res$best_params
 ```
 
-**Hyperparameter tuning.** The search covered `k` = 5–501, league weights 0.3/1, and inclusion/exclusion of `no_history`; decision weights were tuned on validation predictions. The top three settings were:
-
-```{r}
-#| label: knn-tuning
-knitr::kable(
-  knn_cv[order(-cv_macro_f1)][1:min(3, .N),
-    .(k, League_weight = lw, No_history = flag,
-      `CV Macro-F1` = sprintf("%.3f", cv_macro_f1))],
-  caption = "Top kNN settings on five validation folds")
-```
-
-The selected setting was **k = `r knn_bp$k`**, league weight **`r knn_bp$lw`**, with draw/away weights **`r sprintf("%.2f / %.2f", knn_bp$w_draw, knn_bp$w_away)`** (validation Macro-F1 **`r sprintf("%.3f", knn_bp$cv_macro_f1)`**).
-
-```{r}
-#| label: knn-test
-knn_cmp <- as.data.table(knn_res$comparison)
-knitr::kable(
-  knn_cmp[, .(Stage = stage, Accuracy = sprintf("%.3f", accuracy),
-              `Macro-F1` = sprintf("%.3f", macro_f1),
-              `Draw recall` = sprintf("%.3f", recall_draw))],
-  caption = "kNN performance on the Final Test")
-```
-
-The refined kNN achieved Final Test Macro-F1 of 0.453, compared with 0.331 for the context-only baseline, indicating that pre-match strength and history added predictive information. At the weighted model's selected neighbour settings, plain voting achieved accuracy 0.508 but predicted no draws. Decision weighting increased draw recall to 0.244 and Macro-F1 from 0.376 to 0.453, while reducing accuracy to 0.486. This trade-off supports selection by Macro-F1: the final model recognises all three outcomes more evenly, although it still misses most draws. The independently tuned plain-voting pipeline is a separate supplementary comparison, added after the original test results were inspected; it did not determine the designated final model.
-
-```{r}
-#| label: knn-confusion
-#| fig-width: 5.6
-#| fig-height: 3.0
-#| fig-cap: "Final refined kNN confusion matrix (counts)."
-knn_cm <- as.data.table(as.data.frame(knn_res$test_metrics$confusion))
-ggplot(knn_cm, aes(Truth, Predicted, fill = Freq)) +
-  geom_tile(colour = "white") +
-  geom_text(aes(label = Freq), size = 3.4) +
-  scale_fill_gradient(low = "#f7fbff", high = "#2171b5", guide = "none") +
-  labs(x = "True outcome", y = "Predicted outcome") +
-  theme_minimal(base_size = 9)
-```
-
-**Limitation.** Correlated predictors can count similar strength information more than once in Euclidean distance. The selected `k` reached the upper search boundary, so it is the best value within the tested grid rather than a demonstrated global optimum. Choosing neighbour settings and decision weights on the same validation folds can also make validation Macro-F1 optimistic. Draws remain difficult to identify despite weighting, suggesting limited separation with the available predictors.
+kNN estimates outcome probabilities from the results of the most similar historical matches, measured by scaled Euclidean distance across all nine predictors. Validation selected **k = `r knn_bp$k`**, league weight **`r knn_bp$lw`** and draw/away weights **`r sprintf("%.2f / %.2f", knn_bp$w_draw, knn_bp$w_away)`**. The final model reached accuracy 0.486 and Macro-F1 0.453, well above the context-only baseline of 0.331, but draw recall remained low at 0.244. Its main weakness is that correlated predictors can count the same strength signal more than once. The selected `k` also reached the top of the search range, so it is best only among the values tested.
 
 ### 3.4.4 Support Vector Machine
 
-A support vector machine classifies by maximising the margin between classes, a different inductive bias from the probabilistic, linear, instance-based and ensemble methods above, which makes it a useful point of contrast. Two preprocessing steps were required that the tree-based models did not need: the RBF kernel is distance-based, so all numeric predictors were standardised, and `svm()` cannot accept missing values, so matchday-1 rows were median-imputed. Both were fitted inside each training fold.
-
 ```{r}
 #| label: svm-load
+#| include: false
 library(data.table); library(knitr)
 # Full fitting and tuning pipeline: Member4_SVM.qmd
 svm_res <- readRDS("outputs/member4_svm_results.rds")
 f3 <- function(x) sprintf("%.3f", x)
 ```
 
-**Hyperparameter tuning.** Kernel choice was treated as a tuning decision rather than an assumption: a linear kernel was compared with an RBF kernel on the same five validation folds. Cost and gamma were then tuned by grid search. The first grid's optimum fell on its boundary, so the grid was extended until the optimum sat in the interior. Because kernel SVM training scales roughly quadratically with sample size, single-fit runtime was measured on 1,000, 2,000 and 4,000 rows before committing to a grid; the observed scaling confirmed the full grid was affordable on the largest fold of 18,159 matches.
-
-```{r}
-#| label: svm-tuning
-cv  <- as.data.table(svm_res$cv_rbf)
-lin <- as.data.table(svm_res$cv_linear)
-kable(rbind(
-  data.table(Kernel = "Linear", Cost = lin[which.max(cv_macro_f1)]$cost,
-             Gamma = NA_real_,
-             `Validation Macro-F1` = f3(max(lin$cv_macro_f1))),
-  cv[order(-cv_macro_f1)][1:3, .(Kernel = "RBF", Cost = cost, Gamma = gamma,
-             `Validation Macro-F1` = f3(cv_macro_f1))]),
-  caption = "Best linear kernel and top three RBF configurations on the validation folds")
-```
-
-The RBF kernel was retained, consistent with the EDA finding that no single feature separates the three outcome classes linearly. The selected configuration was **cost 4, gamma 0.3**, with decision weights of 1 / `r svm_res$best_weights$w_draw` / `r svm_res$best_weights$w_away` tuned on the same folds.
-
-```{r}
-#| label: svm-test
-cmp <- as.data.table(svm_res$comparison)
-kable(cmp[!grepl("predict\\(\\)", stage),
-          .(Stage = stage, Accuracy = f3(accuracy),
-            `Balanced Accuracy` = f3(balanced_accuracy),
-            `Macro-F1` = f3(macro_f1))],
-      caption = "SVM performance on the Final Test")
-```
-
-Decision weighting raised Macro-F1 from 0.361 to 0.423 and draw recall from 0.085 to 0.218, at a cost of 3.6 percentage points of accuracy — the same trade-off observed for the other four models.
-
-**Limitation.** Class probabilities from `e1071::svm` are obtained by Platt scaling fitted after training rather than directly from the model. This limited how much decision-weight tuning could improve minority-class recall relative to a probabilistic classifier such as LDA, and is the main reason the SVM finished behind the other four models on Macro-F1.
+The SVM separates outcomes by maximising the margin between classes, while the RBF kernel allows a nonlinear boundary. Numeric predictors were standardised and missing values median-imputed within each fold. Validation selected an RBF model with cost 4, gamma 0.3 and home/draw/away weights of 1/`r svm_res$best_weights$w_draw`/`r svm_res$best_weights$w_away`. Weighting lifted Macro-F1 from 0.361 to 0.423 and draw recall from 0.085 to 0.218, though accuracy fell by 3.6 percentage points. This was the weakest final model: its probabilities are produced through Platt scaling after fitting, which limited the benefit of decision weighting compared with a directly probabilistic model such as LDA.
 
 ### 3.4.5 Random Forest
 
-A Random Forest (`ranger`, 500 trees) averages many decision trees grown on bootstrap samples, each split choosing from a random subset of features. It is the only ensemble, non-parametric model in the comparison: it assumes no functional form and can capture interactions. Splits use one variable at a time, so no standardisation was needed, and all nine features were kept despite the correlated pairs in Section 2.3. Within each training fold, NAs were replaced by fold medians, with one 0/1 indicator per distinct missingness pattern so the forest can distinguish "no history yet" from "evenly matched". A probability forest was grown so that decision weights could be applied to its class probabilities.
-
 ```{r}
 #| label: rf-load
+#| include: false
 library(data.table); library(knitr); library(ggplot2)
 # Full fitting and tuning pipeline: Member5_Random_Forest.qmd
 rf_res <- readRDS("outputs/member5_rf_results.rds")
@@ -466,25 +292,16 @@ rf_bp  <- rf_res$best_params
 rf_big <- rf_cv[min_node >= 50]          # leaves of at least 50 matches
 ```
 
-**Hyperparameter tuning.** `mtry` (features tried per split) was searched over {1, 2, 3, 4, 6} and `min.node.size` (smallest leaf) over {10, 50, 100, 200, 400}, with decision weights tuned for each combination. The selected forest uses **mtry `r rf_bp$mtry`, min.node.size `r rf_bp$min_node`** and home/draw/away weights 1 / `r rf_bp$w_draw` / `r rf_bp$w_away`, giving a validation Macro-F1 of `r f3(rf_bp$cv_macro_f1)`. The surface was flat: all combinations with leaves of at least 50 matches scored `r f3(min(rf_big$cv_macro_f1))`–`r f3(max(rf_big$cv_macro_f1))`. Only very small leaves, which memorise individual results, did worse.
-
-```{r}
-#| label: rf-test
-rf_cmp <- as.data.table(rf_res$comparison)[model == "Random Forest"]
-kable(rf_cmp[, .(Stage = stage, Accuracy = f3(accuracy),
-                 `Balanced Acc.` = f3(balanced_accuracy),
-                 `Macro-F1` = f3(macro_f1), `Recall: Draw` = f3(recall_draw))],
-      caption = "Random Forest performance on the Final Test")
-```
-
 ```{r}
 #| label: rf-test-values
+#| include: false
+rf_cmp   <- as.data.table(rf_res$comparison)[model == "Random Forest"]
 rf_fin   <- rf_cmp[grepl("final", stage)]
 rf_plain <- rf_cmp[grepl("most-probable", stage)]
 rf_pc    <- rf_res$test_metrics$per_class
 ```
 
-Weighting trades accuracy (`r f3(rf_plain$accuracy)` → `r f3(rf_fin$accuracy)`) for draw recall (`r f3(rf_plain$recall_draw)` → `r f3(rf_fin$recall_draw)`). Final class F1: home `r f3(rf_pc$f1[1])`, draw `r f3(rf_pc$f1[2])`, away `r f3(rf_pc$f1[3])`.
+Random Forest averages 500 bootstrap-grown decision trees, allowing nonlinear patterns and interactions without standardising the predictors. The selected forest used **mtry `r rf_bp$mtry`**, minimum node size **`r rf_bp$min_node`** and home/draw/away weights of 1/`r rf_bp$w_draw`/`r rf_bp$w_away`. It achieved Final Test Macro-F1 0.451; weighting improved draw recall from `r f3(rf_plain$recall_draw)` to `r f3(rf_fin$recall_draw)` but reduced accuracy. Season points per game was its most useful feature, followed by table position and recent goal difference. These importance scores show predictive reliance rather than causal effects, and correlated features can split credit between themselves.
 
 ```{r}
 #| label: fig-rf-importance
@@ -513,10 +330,6 @@ ggplot(imp_plot, aes(100 * importance, label)) +
   labs(x = "Accuracy lost when shuffled (percentage points)", y = NULL) +
   theme_minimal(base_size = 9)
 ```
-
-Season-long strength dominates. Shuffling the points-per-game gap costs 3.4 percentage points of accuracy, twice any other feature, followed by table position and recent goal difference. League contributes nothing, consistent with the EDA.
-
-**Limitation.** Permutation importance measures predictive reliance, not causal effect. It also splits credit between correlated features (`points_per_game_diff` and `table_pos_diff`, r = 0.90), understating the combined weight of season strength.
 
 ## 3.5 Hyperparameter Tuning
 
@@ -576,12 +389,9 @@ Choosing settings and weights on the same folds makes validation scores mildly o
 
 ## 4.1 Evaluation Metrics
 
-Four metrics are reported for every model, computed by a single shared scoring function on the same 5,256-match Final Test so that differences reflect model behaviour rather than differences in measurement.
-Macro-F1 is the primary metric and determines the final model choice. Accuracy alone is unsuitable for this problem: always predicting a home win achieves 43.0% accuracy while scoring zero on two of the three outcomes. Macro-F1 averages the F1 score across all three classes equally, so a model that abandons draws — the minority class at 25% of matches — is penalised rather than rewarded. This was decided before any model was fitted.
-Accuracy is reported as a supporting measure because it is the most intuitive summary and allows direct comparison against the majority-class reference of 0.430.
-Balanced accuracy, the mean of the three class recalls, provides a second imbalance-robust view and is unaffected by how often each class is predicted.
-Class-level precision, recall and F1 are reported for home wins, draws and away wins separately, since the aggregate metrics conceal which outcomes a model handles well. Draw recall in particular proved decisive: before decision weighting, several models identified almost no draws despite achieving reasonable accuracy.
-Confusion matrices are used diagnostically to show not only how often a model is wrong but in which direction, which Section 4.3 draws on when comparing the final candidates.
+All models are evaluated on the same 5,256-match Final Test using one shared scoring function. Macro-F1 is the primary metric because it gives equal weight to home wins, draws and away wins. Accuracy alone would be misleading: always predicting a home win is correct 43.0% of the time but fails completely on the other two classes.
+
+Accuracy remains useful as an intuitive summary, while balanced accuracy provides a second measure that is less affected by class imbalance. Class-level precision, recall and F1 show which outcomes each model handles well, especially whether it can identify draws. Confusion matrices add a final diagnostic view by showing the direction of prediction errors.
 
 ## 4.2 Model Performance Comparison
 
@@ -607,19 +417,20 @@ LDA achieved the highest Macro-F1 at 0.463, followed by multinomial logistic reg
 ## 4.3 Final Model Selection
 
 The four leading models differ by only 0.012 in Macro-F1 across 5,256 matches, a margin too small to attribute confidently to genuine differences in model quality. These four are therefore treated as equivalent on predictive performance; only the SVM can be separated on results alone, and the reason for its weaker showing is documented in Section 3.4.4.
+
 LDA is selected as the final model. Where predictive performance is equivalent, selection must rest on other grounds, and LDA is the strongest on each. It is the most interpretable of the candidates, since each predictor enters through a single discriminant coefficient whose sign and magnitude can be read directly. It is the cheapest to train, with no hyperparameters requiring a search. And it estimates class probabilities directly from the model rather than deriving them afterwards, which made decision-weight tuning more effective for it than for the SVM, where Platt-scaled probabilities limited the achievable gain. Claiming a clear winner on a 0.006 margin would overstate what the evidence supports; choosing the simplest model among equals is the defensible conclusion.
+
 Class-level performance supports this reading. LDA recovers 33% of draws with 30% precision, while identifying 58% of home wins and 47% of away wins. No model in the comparison handles draws well, and the pattern is consistent across all five despite their differing assumptions, which points to the feature set rather than the choice of algorithm as the binding constraint.
 
 ## 4.4 Process Reflection
 
-The Data Investigation Process shaped this project most visibly at the exploration stage. Two forms of target leakage were identified before any model was fitted: the supplied league position columns record standings after each match, and the club attribute fields are a single present-day snapshot rather than values contemporaneous with each fixture. Had modelling begun directly from the raw data, the project would have reported substantially inflated results built on information unavailable before kick-off. The sequencing of the process — explore, then engineer, then model — is what surfaced both.
-Fixing the shared infrastructure before any modelling began proved equally important. Agreeing the chronological split, the validation folds and a single scoring function in advance meant that five models, fitted independently by five people, could be compared without re-running anything or reconciling differing definitions.
-Two things would be done differently. Feature engineering was assigned as a blocking deliverable but was not completed on schedule and was eventually built by another member, which delayed every downstream model; a task that the whole team depends on needs a firm date and a named backup. Second, decision-weight tuning was adopted by individual members before the group agreed on it, briefly making the results non-comparable until it was applied uniformly. A refinement that changes the ranking on the primary metric should be a group decision made at the planning stage rather than an individual one discovered during comparison.
+The Data Investigation Process gave the project a clear order: explore the data, engineer safe pre-match features, and only then fit the models. This sequence exposed two leakage risks—the supplied league positions were recorded after each match, while club attributes came from a present-day snapshot—and prevented unrealistically strong results. Agreeing on one chronological split, common validation folds and a shared scoring function also made the five independently fitted models comparable. If the project were repeated, we would set an earlier deadline and backup owner for feature engineering, since delays there affected every model, and agree on decision-weight tuning before individual modelling began rather than standardising it later.
 
 # 5. Conclusion and Insights
 
 ```{r}
 #| label: conclusion-values
+#| include: false
 library(data.table)
 pct <- function(x) sprintf("%.1f%%", 100 * x)
 f3  <- function(x) sprintf("%.3f", x)
@@ -660,17 +471,22 @@ Pre-match characteristics classify match outcomes **partially**: clearly better 
 **Future improvements.**
 
 - Add evenness features from the existing data, such as the absolute strength gap and each team's recent draw rate, and test whether draw F1 improves.
-- Replace snapshot attributes with a time-varying rating, such as an Elo-style rating updated from past results only.
+- A useful extension would be to replace static team information with an Elo-style rating that updates team strength after each match using only past results (Hvattum & Arntzen, 2010).
 - Fit an ordinal model (away win < draw < home win), which places the draw explicitly between the two wins, and compare models with a paired test such as McNemar's test.
 
 
 # 6. References
 
-List all the references used throughout the report using APA7 Style.
+Baboota, R., & Kaur, H. (2019). Predictive analysis and modelling football results using machine learning approach for English Premier League. *International Journal of Forecasting, 35*(2), 741–755. https://doi.org/10.1016/j.ijforecast.2018.01.003
+
+Berrar, D., Lopes, P., & Dubitzky, W. (2024). A data- and knowledge-driven framework for developing machine learning models to predict soccer match outcomes. *Machine Learning, 113*, 8165–8204. https://doi.org/10.1007/s10994-024-06625-9
+
+Cariboo, D. (n.d.). *Football data from Transfermarkt* [Data set]. Kaggle. Retrieved October 27, 2026, from https://www.kaggle.com/datasets/davidcariboo/player-scores
+
+Hvattum, L. M., & Arntzen, H. (2010). Using ELO ratings for match result prediction in association football. *International Journal of Forecasting, 26*(3), 460–470. https://doi.org/10.1016/j.ijforecast.2009.10.002
 
 # 7. AI Use Statement
-If applicable,
 
-I acknowledge the use of [AI tool + version, publisher and URL] to generate [summary of what was generated].
+We acknowledge the use of OpenAI ChatGPT (OpenAI, https://chatgpt.com/) to assist us in dividing tasks, checking for coding errors, and correcting grammatical errors in the report.
 
 
